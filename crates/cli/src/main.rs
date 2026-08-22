@@ -1,4 +1,7 @@
 //! `wiivci` — inject a Wii game into a Wii U Virtual Console (WUP) package.
+//!
+//! Copyright (C) 2026 Hayden. Licensed under the GNU General Public License, version 3 or
+//! later. This program comes with ABSOLUTELY NO WARRANTY. See the LICENSE file for details.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

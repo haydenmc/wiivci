@@ -88,6 +88,12 @@ v1 targets Wii ISO/RVZ → WUP with core options. Not yet implemented: `fw.img`
 controller-remap patches, video-mode/region disc patches, the GameCube/Nintendont path,
 cheats, and downloading the base from NUS (the `BaseSource` trait leaves room for it).
 
+## License
+
+Licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later). See
+[`LICENSE`](LICENSE). This is compatible with the tool's Apache-2.0/MIT-licensed dependencies
+(e.g. `nod`), which GPLv3 may incorporate.
+
 ## Legal
 
 This tool creates no copyrighted content and bundles no keys, certificates, or Nintendo
