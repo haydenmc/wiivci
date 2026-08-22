@@ -15,7 +15,7 @@
 //! …      content-access permissions, to 0x350
 //! ```
 
-use aes::cipher::{block_padding::NoPadding, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes::Aes128;
 
 const SIG_TYPE_RSA2048_SHA256: u32 = 0x0001_0004;
@@ -72,6 +72,18 @@ pub fn encrypt_title_key(common_key: &[u8; 16], title_id: u64, title_key: &[u8; 
     let mut buf = *title_key;
     <cbc::Encryptor<Aes128>>::new(common_key.into(), &iv.into())
         .encrypt_padded_mut::<NoPadding>(&mut buf, 16)
+        .expect("16-byte buffer");
+    buf
+}
+
+/// Decrypt an encrypted title key (as stored in a ticket or a title-key database) with the
+/// Wii U common key. IV = `title_id ++ 0*8`. Inverse of [`encrypt_title_key`].
+pub fn decrypt_title_key(common_key: &[u8; 16], title_id: u64, enc_title_key: &[u8; 16]) -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    iv[..8].copy_from_slice(&title_id.to_be_bytes());
+    let mut buf = *enc_title_key;
+    <cbc::Decryptor<Aes128>>::new(common_key.into(), &iv.into())
+        .decrypt_padded_mut::<NoPadding>(&mut buf)
         .expect("16-byte buffer");
     buf
 }

@@ -7,6 +7,7 @@
 pub mod cert;
 pub mod content;
 pub mod content_crypto;
+pub mod extract;
 pub mod fst;
 pub mod ticket;
 pub mod tmd;

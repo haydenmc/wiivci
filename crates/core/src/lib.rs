@@ -14,6 +14,7 @@ pub mod input;
 pub mod keys;
 pub mod meta;
 pub mod nfs;
+pub mod nus;
 pub mod package;
 pub mod pipeline;
 

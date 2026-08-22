@@ -18,7 +18,7 @@ Like every injector, this tool never bundles copyrighted or secret material. You
 | Input | Flag | Notes |
 |-------|------|-------|
 | A Wii disc image | `--input` | ISO, RVZ, WBFS, CISO, NKit, GCZ — read via [`nod`](https://github.com/encounter/nod). |
-| A Wii U VC **base title** | `--base` | A Cemu `.wua` archive *or* an extracted `code/`,`content/`,`meta/` directory. By convention Rhythm Heaven Fever (`00050000101B0700`). Supplies the closed Nintendo framework (`fw.img`, `frisbiiU.rpx`, …) that has no clean-room reimplementation. |
+| A Wii U VC **base title** | `--base` *or* `--base-title-id` | A Cemu `.wua` archive / extracted directory (`--base`), **or** downloaded live from NUS (`--base-title-id <16-hex>` + `--base-title-key`). By convention Rhythm Heaven Fever (`00050000101B0700`). Supplies the closed Nintendo framework (`fw.img`, `frisbiiU.rpx`, …) that has no clean-room reimplementation. |
 | The **Wii U common key** | `--wiiu-common-key` | 32 hex chars, a key file, or the `WIIU_COMMON_KEY` env var. Validated by fingerprint. Used to encrypt the title key into the ticket. |
 | A **certificate chain** | `--cert` | `title.cert` from any dumped Wii U title. It is Nintendo's public chain, required by the format, and identical across titles — so it is user-supplied rather than bundled. |
 
@@ -42,6 +42,25 @@ console needs signature patches (Aroma/Tiramisu/Mocha) to install and boot fakes
 Useful options: `--icon/--boot-tv/--boot-drc <png>` to supply artwork, `--region jp|us|eu`,
 `--no-gamepad`, `--offline` (skip GameTDB/art lookups), `--work-dir <dir>` (keep the
 intermediate build tree).
+
+### Downloading the base from NUS
+
+Instead of `--base`, you can have the tool fetch the base title straight from Nintendo's CCS
+CDN and decrypt it in-process (a CDecrypt-style extractor). You provide the title id and its
+encrypted title key (as found in title-key databases — NUS does not serve tickets for paid
+titles):
+
+```sh
+wiivci \
+  --input "Wii Sports (USA).rvz" \
+  --base-title-id  00050000101B0700 \
+  --base-title-key <32-hex encrypted title key> \
+  --out ./out --wiiu-common-key <32-hex> --cert ./title.cert --title "Wii Sports"
+```
+
+Only the contents needed for the base framework are downloaded — the base's own game data
+(`hif_*.nfs`, ~450 MB) is skipped since the injected game replaces it. `--base-version <n>`
+pins a TMD version and `--nus-url <url>` points at a mirror.
 
 ## How it works
 

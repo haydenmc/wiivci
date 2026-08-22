@@ -50,7 +50,7 @@ fn is_base_game_nfs(name: &str) -> bool {
     name.starts_with("hif_") && name.ends_with(".nfs")
 }
 
-fn finalize_stage(build_dir: &Path) -> Result<StagedBase> {
+pub(crate) fn finalize_stage(build_dir: &Path) -> Result<StagedBase> {
     let code_dir = build_dir.join("code");
     let content_dir = build_dir.join("content");
     let meta_dir = build_dir.join("meta");

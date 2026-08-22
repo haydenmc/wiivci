@@ -103,6 +103,31 @@ pub fn build_tmd(title_id: u64, group_id: u16, contents: &[ContentRecord]) -> Ve
     out
 }
 
+/// Parse the content records from a TMD's bytes.
+pub fn parse_content_records(tmd: &[u8]) -> Result<Vec<ContentRecord>, &'static str> {
+    if tmd.len() < RECORDS_OFF + 2 {
+        return Err("TMD too short");
+    }
+    let count = u16::from_be_bytes([tmd[0x1DE], tmd[0x1DF]]) as usize;
+    if tmd.len() < RECORDS_OFF + count * 0x30 {
+        return Err("TMD content records truncated");
+    }
+    let mut records = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = RECORDS_OFF + i * 0x30;
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&tmd[o + 16..o + 36]);
+        records.push(ContentRecord {
+            id: u32::from_be_bytes(tmd[o..o + 4].try_into().unwrap()),
+            index: u16::from_be_bytes(tmd[o + 4..o + 6].try_into().unwrap()),
+            content_type: u16::from_be_bytes(tmd[o + 6..o + 8].try_into().unwrap()),
+            size: u64::from_be_bytes(tmd[o + 8..o + 16].try_into().unwrap()),
+            hash,
+        });
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

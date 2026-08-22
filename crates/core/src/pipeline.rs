@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::assets::images::{png_to_tga, BootTexture};
 use crate::assets::{artrepo, gametdb};
-use crate::base::open_base;
+use crate::base::BaseSource;
 use crate::error::{Error, Result};
 use crate::input::SourceDisc;
 use crate::keys::WiiUCommonKey;
@@ -54,8 +54,8 @@ impl Region {
 pub struct Config {
     /// Source Wii disc image (ISO/RVZ/…).
     pub input: PathBuf,
-    /// Base title (`.wua` archive or extracted directory).
-    pub base: PathBuf,
+    /// Base title source (local `.wua`/directory, or an NUS download).
+    pub base: Box<dyn BaseSource>,
     /// Output directory for the WUP package.
     pub out: PathBuf,
     /// Wii U common key (validated).
@@ -95,7 +95,7 @@ pub struct Summary {
 
 /// Run the injection described by `config`, using `work_dir` as scratch space for the staged
 /// build tree. `work_dir` should be empty; callers typically pass a fresh temp directory.
-pub fn run(config: &Config, work_dir: &Path) -> Result<Summary> {
+pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
     log::info!("opening source disc {}", config.input.display());
     let mut source = SourceDisc::open(&config.input)?;
     let game_id = source.game_id_str();
@@ -103,9 +103,8 @@ pub fn run(config: &Config, work_dir: &Path) -> Result<Summary> {
     let ids = titleid::derive(disc4);
 
     // 1. Stage the base into work_dir/{code,content,meta}.
-    log::info!("staging base title {}", config.base.display());
-    let mut base = open_base(&config.base)?;
-    let staged = base.stage(work_dir)?;
+    log::info!("staging base title");
+    let staged = config.base.stage(work_dir)?;
 
     // 2. Convert the disc to NFS under content/.
     log::info!("building NFS (this reads the whole disc)…");
@@ -125,7 +124,7 @@ pub fn run(config: &Config, work_dir: &Path) -> Result<Summary> {
     std::fs::write(staged.code_dir.join("app.xml"), appxml::generate(&ids))
         .map_err(|e| Error::io(staged.code_dir.join("app.xml"), e))?;
 
-    let title = resolve_title(config, &game_id);
+    let title = resolve_title(&config, &game_id);
     let meta_path = staged.meta_dir.join("meta.xml");
     let base_meta = std::fs::read_to_string(&meta_path).map_err(|e| Error::io(&meta_path, e))?;
     let patched = patch_meta(
@@ -142,7 +141,7 @@ pub fn run(config: &Config, work_dir: &Path) -> Result<Summary> {
     std::fs::write(&meta_path, patched).map_err(|e| Error::io(&meta_path, e))?;
 
     // 6. Boot textures (icon / TV / DRC).
-    resolve_textures(config, &game_id, &staged.meta_dir)?;
+    resolve_textures(&config, &game_id, &staged.meta_dir)?;
 
     // 7. Package.
     log::info!("packaging WUP into {}", config.out.display());

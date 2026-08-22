@@ -6,16 +6,19 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use anyhow::{anyhow, Context, Result};
+use clap::{ArgGroup, Parser, ValueEnum};
 
+use wiivci_core::base::{open_base, BaseSource};
 use wiivci_core::keys::WiiUCommonKey;
+use wiivci_core::nus::{NusBase, NusClient};
 use wiivci_core::package::cert::CertChain;
 use wiivci_core::pipeline::{self, Config, Region};
 
 /// Inject a Wii game (ISO/RVZ) into an installable Wii U Virtual Console package.
 #[derive(Parser, Debug)]
 #[command(name = "wiivci", version, about)]
+#[command(group(ArgGroup::new("base_src").required(true).args(["base", "base_title_id"])))]
 struct Cli {
     /// Source Wii disc image (ISO, RVZ, WBFS, …).
     #[arg(short, long)]
@@ -23,7 +26,24 @@ struct Cli {
 
     /// Base Wii U VC title: a Cemu `.wua` archive or an extracted title directory.
     #[arg(short, long)]
-    base: PathBuf,
+    base: Option<PathBuf>,
+
+    /// Instead of --base, download the base from NUS: its 16-hex title id
+    /// (e.g. 00050000101B0700). Requires --base-title-key.
+    #[arg(long, value_name = "HEX16")]
+    base_title_id: Option<String>,
+
+    /// Encrypted title key (32 hex) for the NUS base title, as found in title-key databases.
+    #[arg(long, value_name = "HEX32", requires = "base_title_id")]
+    base_title_key: Option<String>,
+
+    /// Specific base TMD version to download (default: latest).
+    #[arg(long, value_name = "N", requires = "base_title_id")]
+    base_version: Option<u32>,
+
+    /// Override the NUS/CCS base URL (default: the Nintendo CCS CDN).
+    #[arg(long, value_name = "URL", requires = "base_title_id")]
+    nus_url: Option<String>,
 
     /// Output directory for the WUP package (created if absent).
     #[arg(short, long)]
@@ -87,6 +107,46 @@ impl From<RegionArg> for Region {
     }
 }
 
+/// Parse exactly `N` hex bytes from a string (ignoring surrounding whitespace).
+fn parse_hex<const N: usize>(s: &str) -> Result<[u8; N]> {
+    let s = s.trim();
+    if s.len() != N * 2 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!("expected {} hex characters, got {:?}", N * 2, s));
+    }
+    let mut out = [0u8; N];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    Ok(out)
+}
+
+/// Build the base source from the CLI: a local path, or an NUS download.
+fn build_base(cli: &Cli, wiiu_common_key: &WiiUCommonKey) -> Result<Box<dyn BaseSource>> {
+    if let Some(path) = &cli.base {
+        return open_base(path).with_context(|| format!("opening base {}", path.display()));
+    }
+    // NUS path (validated present by the arg group).
+    let title_id_hex = cli.base_title_id.as_ref().expect("arg group guarantees this");
+    let title_id = u64::from_str_radix(title_id_hex.trim(), 16)
+        .with_context(|| format!("invalid --base-title-id {title_id_hex:?}"))?;
+    let key_hex = cli
+        .base_title_key
+        .as_ref()
+        .ok_or_else(|| anyhow!("--base-title-key is required with --base-title-id"))?;
+    let enc_title_key = parse_hex::<16>(key_hex).context("invalid --base-title-key")?;
+    let client = match &cli.nus_url {
+        Some(url) => NusClient::with_base_url(url),
+        None => NusClient::new(),
+    }?;
+    Ok(Box::new(NusBase::new(
+        title_id,
+        enc_title_key,
+        wiiu_common_key.0,
+        cli.base_version,
+        client,
+    )))
+}
+
 /// Load a key from either an inline hex string or a file path.
 fn load_wiiu_key(arg: &str) -> Result<WiiUCommonKey> {
     let path = std::path::Path::new(arg);
@@ -104,10 +164,11 @@ fn run() -> Result<()> {
     let wiiu_common_key = load_wiiu_key(&cli.wiiu_common_key)?;
     let cert = CertChain::load(&cli.cert)
         .with_context(|| format!("loading certificate chain {}", cli.cert.display()))?;
+    let base = build_base(&cli, &wiiu_common_key)?;
 
     let config = Config {
         input: cli.input,
-        base: cli.base,
+        base,
         out: cli.out,
         wiiu_common_key,
         cert,
@@ -133,7 +194,7 @@ fn run() -> Result<()> {
         }
     };
 
-    let summary = pipeline::run(&config, &work_path)?;
+    let summary = pipeline::run(config, &work_path)?;
 
     println!("\nDone.");
     println!("  Game:      {} ({})", summary.title, summary.game_id);

@@ -16,7 +16,7 @@
 //!   XORed with the content index before the header is encrypted (IV = `u16be(index) ++ 0*14`).
 //! * The data is encrypted with IV = the real `H0[b][0..16]`.
 
-use aes::cipher::{block_padding::NoPadding, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes::Aes128;
 use sha1::{Digest, Sha1};
 
@@ -45,6 +45,12 @@ fn cbc_encrypt(key: &Key, iv: [u8; 16], buf: &mut [u8]) {
     let len = buf.len();
     <cbc::Encryptor<Aes128>>::new(key.into(), &iv.into())
         .encrypt_padded_mut::<NoPadding>(buf, len)
+        .expect("block-aligned buffer");
+}
+
+fn cbc_decrypt(key: &Key, iv: [u8; 16], buf: &mut [u8]) {
+    <cbc::Decryptor<Aes128>>::new(key.into(), &iv.into())
+        .decrypt_padded_mut::<NoPadding>(buf)
         .expect("block-aligned buffer");
 }
 
@@ -151,6 +157,35 @@ pub fn encode_hashed(key: &Key, index: u16, plaintext: &[u8]) -> EncodedContent 
     EncodedContent { data, h3: Some(h3), tmd_hash, size }
 }
 
+/// Decrypt a non-hashed content, returning the padded plaintext (inverse of
+/// [`encode_nonhashed`]; the caller truncates to the real file size using the FST).
+pub fn decode_nonhashed(key: &Key, index: u16, cipher: &[u8]) -> Vec<u8> {
+    let mut buf = cipher.to_vec();
+    if !buf.is_empty() {
+        cbc_decrypt(key, content_iv(index), &mut buf);
+    }
+    buf
+}
+
+/// Decrypt a hashed content, returning the concatenated 0xFC00 data blocks (inverse of
+/// [`encode_hashed`]; hash headers are stripped).
+pub fn decode_hashed(key: &Key, index: u16, cipher: &[u8]) -> Vec<u8> {
+    let nblocks = cipher.len() / HASH_BLOCK_TOTAL;
+    let mut out = Vec::with_capacity(nblocks * HASH_BLOCK_DATA);
+    for b in 0..nblocks {
+        let block = &cipher[b * HASH_BLOCK_TOTAL..(b + 1) * HASH_BLOCK_TOTAL];
+        let mut header = block[..HASH_HEADER].to_vec();
+        cbc_decrypt(key, content_iv(index), &mut header);
+        header[1] ^= index as u8; // recover the real H0 section
+        let mut data_iv = [0u8; 16];
+        data_iv.copy_from_slice(&header[(b % 16) * HASH_LEN..(b % 16) * HASH_LEN + 16]);
+        let mut data = block[HASH_HEADER..].to_vec();
+        cbc_decrypt(key, data_iv, &mut data);
+        out.extend_from_slice(&data);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,12 +211,18 @@ mod tests {
     // These require the extracted reference in .dev/wup_ref and the Wii U common key in the
     // WIIU_COMMON_KEY env var (never stored). Run:
     //   WIIU_COMMON_KEY=<hex> cargo test -p wiivci-core --release -- --ignored retail
-    use aes::cipher::BlockDecryptMut;
-
-    fn cbc_decrypt(key: &Key, iv: [u8; 16], buf: &mut [u8]) {
-        <cbc::Decryptor<Aes128>>::new(key.into(), &iv.into())
-            .decrypt_padded_mut::<NoPadding>(buf)
-            .expect("block-aligned");
+    #[test]
+    fn encode_decode_round_trips() {
+        let key = [0x5Au8; 16];
+        let plain: Vec<u8> = (0..HASH_BLOCK_DATA * 2 + 500).map(|i| (i * 3) as u8).collect();
+        // Hashed: decode returns block-padded data, so compare only the original prefix.
+        let enc = encode_hashed(&key, 7, &plain);
+        let dec = decode_hashed(&key, 7, &enc.data);
+        assert_eq!(&dec[..plain.len()], &plain[..]);
+        // Non-hashed: decode returns the 0x8000-padded plaintext.
+        let enc = encode_nonhashed(&key, 2, &plain);
+        let dec = decode_nonhashed(&key, 2, &enc.data);
+        assert_eq!(&dec[..plain.len()], &plain[..]);
     }
 
     fn ref_dir() -> std::path::PathBuf {
@@ -232,23 +273,10 @@ mod tests {
         let Some(tk) = retail_title_key() else { return };
         let h3_ref = std::fs::read(dir.join("00000003.h3")).unwrap();
 
-        // Decrypt the retail hashed content back to plaintext data blocks.
+        // Decrypt the retail hashed content back to plaintext, then re-encode: an exact
+        // match proves both decode_hashed and encode_hashed against retail.
         let index = 3u16;
-        let nblocks = enc.len() / HASH_BLOCK_TOTAL;
-        let mut plaintext = Vec::new();
-        for b in 0..nblocks {
-            let block = &enc[b * HASH_BLOCK_TOTAL..(b + 1) * HASH_BLOCK_TOTAL];
-            let mut header = block[..HASH_HEADER].to_vec();
-            cbc_decrypt(&tk, content_iv(index), &mut header);
-            header[1] ^= index as u8; // recover the real H0 section
-            let mut data_iv = [0u8; 16];
-            data_iv.copy_from_slice(&header[(b % 16) * HASH_LEN..(b % 16) * HASH_LEN + 16]);
-            let mut data = block[HASH_HEADER..].to_vec();
-            cbc_decrypt(&tk, data_iv, &mut data);
-            plaintext.extend_from_slice(&data);
-        }
-
-        // Re-encode and require an exact match with the retail content and .h3.
+        let plaintext = decode_hashed(&tk, index, &enc);
         let out = encode_hashed(&tk, index, &plaintext);
         assert_eq!(out.h3.as_ref().unwrap(), &h3_ref, ".h3 mismatch");
         assert_eq!(out.data, enc, "hashed content ciphertext mismatch");
