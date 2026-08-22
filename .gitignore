@@ -1,0 +1,22 @@
+/target
+Cargo.lock
+
+# Local test material — real game dumps, never committed
+/test_titles/
+
+# Local dev scratch (staged bases, extracted references, sample output)
+/.dev/
+
+# User-supplied secrets and keys — never committed
+*.bin
+keys.txt
+*.key
+
+# Build output
+/out/
+*.nfs
+*.app
+*.h3
+
+# Editor / OS
+.DS_Store

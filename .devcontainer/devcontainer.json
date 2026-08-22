@@ -1,0 +1,16 @@
+{
+  "image": "mcr.microsoft.com/devcontainers/base:trixie",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/devcontainers/features/rust:1": {},
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
+  // Rootless Podman on an SELinux host (Fedora):
+  //   * keep-id preserves the host uid (1000) inside the container so it lines up
+  //     with vscode (1000) — this makes the mounted source vscode-owned.
+  //   * label=disable opts the container out of SELinux label separation. Without
+  //     it, SELinux denies container_t access to the host's user_home_t-labelled
+  //     source (Permission denied despite correct uid/gid/mode), which also made
+  //     devpod's chown fail and reap the "idle" container.
+  "runArgs": ["--userns=keep-id", "--security-opt", "label=disable"]
+}

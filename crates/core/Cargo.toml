@@ -1,0 +1,25 @@
+[package]
+name = "wiivci-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Library for injecting Wii games into Wii U Virtual Console (WUP) packages"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+nod = "1.4"
+aes = "0.8"
+cbc = "0.1"
+sha1 = "0.10"
+md-5 = "0.10"
+image = { version = "0.25", default-features = false, features = ["png", "tga"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+quick-xml = "0.37"
+byteorder = "1"
+log = "0.4"
+zarust = "0.2.1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
