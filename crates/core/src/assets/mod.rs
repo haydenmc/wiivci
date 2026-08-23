@@ -3,6 +3,7 @@
 pub mod artrepo;
 pub mod gametdb;
 pub mod images;
+pub mod nintendont;
 
 pub use artrepo::{art_png_name, download_texture};
 pub use gametdb::lookup_title;

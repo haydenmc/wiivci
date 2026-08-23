@@ -53,6 +53,7 @@ fn sha1(buf: &[u8]) -> [u8; 20] {
 
 /// The result of patching the disc: full replacement clusters/sectors (keyed by disc sector,
 /// Per-partition plan consumed by [`crate::nfs::build_nfs`].
+#[derive(Clone)]
 pub struct PartitionPlan {
     /// First sector of the partition on the logical disc.
     pub start_sector: u32,
@@ -71,6 +72,7 @@ pub struct PartitionPlan {
 
 /// A whole-disc rebuild plan: how to rebuild each partition's Wii hash tree (and apply any
 /// `main.dol` edits) while streaming the NFS.
+#[derive(Clone)]
 pub struct DiscPlan {
     /// One entry per partition, matched to a structural range by `start_sector`.
     pub partitions: Vec<PartitionPlan>,

@@ -47,6 +47,28 @@ pub struct SourceDisc {
     raw_cert_chain: Option<Vec<u8>>,
 }
 
+/// A `Read + Seek` trait object alias so a decrypted disc stream can be passed dynamically.
+///
+/// `Seek` is not an auto-trait, so `dyn Read + Seek` is not expressible directly; this combined
+/// supertrait (with a blanket impl) gives us an object-safe `dyn ReadSeek`.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek + ?Sized> ReadSeek for T {}
+
+/// A source of a decrypted logical Wii disc for the NFS encoder ([`crate::nfs::build_nfs`]).
+///
+/// Provides the disc bytes (partition data decrypted, hash blocks present — the representation
+/// the Wii U VC NFS format stores), the partition layout, and the total size. Implemented by
+/// [`SourceDisc`] (a real Wii disc read via `nod`) and by the synthetic Wii disc authored for a
+/// GameCube/Nintendont inject (see `crate::wii_author`).
+pub trait DecryptedDisc {
+    /// Every partition's sector span, sorted ascending by start sector.
+    fn partition_spans(&self) -> &[PartitionSpan];
+    /// The logical disc size in bytes.
+    fn disc_size(&self) -> u64;
+    /// The decrypted disc byte stream (partition data decrypted, hash blocks intact).
+    fn disc_stream(&mut self) -> &mut dyn ReadSeek;
+}
+
 /// The sector range occupied by a partition on the logical disc.
 #[derive(Clone, Copy, Debug)]
 pub struct PartitionSpan {
@@ -239,5 +261,171 @@ impl SourceDisc {
     /// blocks intact; sectors outside partitions are raw disc bytes.
     pub fn stream(&mut self) -> &mut Disc {
         &mut self.disc
+    }
+}
+
+impl DecryptedDisc for SourceDisc {
+    fn partition_spans(&self) -> &[PartitionSpan] {
+        &self.partitions
+    }
+
+    fn disc_size(&self) -> u64 {
+        self.disc_size
+    }
+
+    fn disc_stream(&mut self) -> &mut dyn ReadSeek {
+        &mut self.disc
+    }
+}
+
+/// Which console an input image is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscKind {
+    /// A Wii disc (injected directly; see [`SourceDisc`]).
+    Wii,
+    /// A GameCube disc (injected via Nintendont; see [`GcImage`]).
+    GameCube,
+}
+
+/// Peek at an input image and report whether it is a Wii or GameCube disc, so the pipeline can
+/// pick the right path. Reads only the disc header.
+pub fn probe(path: impl AsRef<Path>) -> Result<DiscKind> {
+    let options = OpenOptions {
+        rebuild_encryption: false,
+        ..Default::default()
+    };
+    let disc = Disc::new_with_options(path.as_ref(), &options)?;
+    let header = disc.header();
+    if header.is_wii() {
+        Ok(DiscKind::Wii)
+    } else if header.is_gamecube() {
+        Ok(DiscKind::GameCube)
+    } else {
+        Err(Error::UnsupportedDisc(format!(
+            "'{}' is neither a Wii nor a GameCube disc",
+            path.as_ref().display()
+        )))
+    }
+}
+
+/// A source GameCube disc image opened for reading.
+///
+/// Unlike a Wii disc, a GameCube image has no partitions, encryption, hash tree, or ticket/TMD —
+/// it is a plain 1:1 disc image. `nod` transparently decompresses/reconstructs the container
+/// (ISO/GCM/CISO/NKit/GCZ/RVZ) to its logical full-size bytes, which we embed verbatim as
+/// `files/game.iso` inside the synthetic Wii disc that boots Nintendont (see `crate::wii_author`).
+pub struct GcImage {
+    disc: Disc,
+    path: PathBuf,
+    game_id: [u8; 6],
+    iso_size: u64,
+}
+
+impl GcImage {
+    /// Open a GameCube disc image. Errors if the image is not a GameCube disc.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let options = OpenOptions {
+            rebuild_encryption: false,
+            ..Default::default()
+        };
+        let disc = Disc::new_with_options(&path, &options)?;
+
+        let header = disc.header();
+        if !header.is_gamecube() {
+            return Err(Error::UnsupportedDisc(format!(
+                "'{}' is not a GameCube disc",
+                path.display()
+            )));
+        }
+        let mut game_id = [0u8; 6];
+        game_id.copy_from_slice(&header.game_id);
+        let iso_size = disc.disc_size();
+
+        Ok(GcImage {
+            disc,
+            path,
+            game_id,
+            iso_size,
+        })
+    }
+
+    /// The 6-character game ID (e.g. `GM2E8P`).
+    pub fn game_id(&self) -> [u8; 6] {
+        self.game_id
+    }
+
+    /// The 6-character game ID as a string.
+    pub fn game_id_str(&self) -> String {
+        String::from_utf8_lossy(&self.game_id).into_owned()
+    }
+
+    /// The 4-character disc ID used to derive the Wii U title ID (first 4 game-id bytes).
+    pub fn disc_id4(&self) -> [u8; 4] {
+        [
+            self.game_id[0],
+            self.game_id[1],
+            self.game_id[2],
+            self.game_id[3],
+        ]
+    }
+
+    /// The region code character (4th game-id byte: `E`=NTSC-U, `P`=PAL, `J`=NTSC-J, …).
+    pub fn region_char(&self) -> u8 {
+        self.game_id[3]
+    }
+
+    /// The logical full-size ISO length in bytes.
+    pub fn iso_size(&self) -> u64 {
+        self.iso_size
+    }
+
+    /// The path the image was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The decrypted, reconstructed logical ISO byte stream (`Read + Seek`), covering
+    /// `0..iso_size()`.
+    pub fn iso_stream(&mut self) -> &mut dyn ReadSeek {
+        &mut self.disc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify GameCube ingestion against a real image: probe reports GameCube, the game id and
+    /// logical size are sane, and the first bytes are the game id (GameCube images have no magic
+    /// word at 0x00 — the id sits there). Uses `test_titles/Super Monkey Ball 2 (USA).rvz`.
+    #[test]
+    #[ignore = "reads a GameCube test image; run manually with the test title present"]
+    fn opens_gamecube_test_image() {
+        let title = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_titles/Super Monkey Ball 2 (USA).rvz");
+        if !title.exists() {
+            eprintln!("skipping: {} not present", title.display());
+            return;
+        }
+
+        assert_eq!(probe(&title).unwrap(), DiscKind::GameCube);
+
+        let mut gc = GcImage::open(&title).unwrap();
+        let id = gc.game_id_str();
+        eprintln!("game id = {id}, iso size = {} bytes", gc.iso_size());
+        assert_eq!(id.len(), 6);
+        // Super Monkey Ball 2 (USA) is GM2E8P.
+        assert!(id.starts_with("GM2E"), "unexpected game id {id}");
+        assert_eq!(gc.disc_id4(), *b"GM2E");
+        assert_eq!(gc.region_char(), b'E');
+        // A standard single-layer GameCube disc is 1,459,978,240 bytes.
+        assert_eq!(gc.iso_size(), 1_459_978_240);
+
+        // The logical stream starts with the game id at offset 0.
+        let mut head = [0u8; 6];
+        gc.iso_stream().seek(SeekFrom::Start(0)).unwrap();
+        gc.iso_stream().read_exact(&mut head).unwrap();
+        assert_eq!(&head, gc.game_id().as_slice());
     }
 }

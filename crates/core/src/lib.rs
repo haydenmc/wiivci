@@ -11,13 +11,16 @@ pub mod assets;
 pub mod base;
 pub mod disc_patch;
 pub mod error;
+pub mod fwimg;
 pub mod input;
 pub mod keys;
 pub mod meta;
 pub mod nfs;
+pub mod nincfg;
 pub mod nus;
 pub mod package;
 pub mod pipeline;
 pub mod video;
+pub mod wii_author;
 
 pub use error::{Error, Result};

@@ -16,15 +16,18 @@ use crate::assets::{artrepo, gametdb};
 use crate::base::BaseSource;
 use crate::disc_patch;
 use crate::error::{Error, Result};
-use crate::input::SourceDisc;
+use crate::fwimg;
+use crate::input::{GcImage, SourceDisc};
 use crate::keys::WiiUCommonKey;
 use crate::meta::appxml;
 use crate::meta::metaxml::{patch as patch_meta, MetaOptions};
 use crate::meta::titleid;
 use crate::nfs::build_nfs;
+use crate::nincfg::{self, NincfgOptions};
 use crate::package::cert::CertChain;
 use crate::package::{build_package, PackageParams, PackageStats};
 use crate::video::VideoPatches;
+use crate::wii_author::{self, GcDiscInputs};
 
 /// Fixed plaintext title key used to encrypt content (stored, encrypted, in the ticket — its
 /// value is arbitrary, matching the convention of the reference tools).
@@ -79,8 +82,30 @@ pub struct Config {
     pub gamepad: bool,
     /// Fetch missing art/title from online services.
     pub online: bool,
-    /// Optional `main.dol` video patches (flicker filter / dithering).
+    /// Optional `main.dol` video patches (flicker filter / dithering). Wii path only.
     pub video: VideoPatches,
+    /// When `Some`, the input is a GameCube image and is injected via Nintendont with these
+    /// options (see [`run_gamecube`]). When `None`, the input is treated as a Wii disc.
+    pub gamecube: Option<GameCubeOptions>,
+}
+
+/// Options for a GameCube (Nintendont) injection.
+pub struct GameCubeOptions {
+    /// Nintendont's `boot.dol`, used as the synthetic disc's `main.dol`.
+    pub nintendont_dol: Vec<u8>,
+    /// The Wii apploader placed in the synthetic disc. May be empty (the output then validates but
+    /// will not boot on hardware — a real apploader is required for that).
+    pub apploader: Vec<u8>,
+    /// Force 16:9 in the generated `nincfg.bin`.
+    pub widescreen: bool,
+    /// GameCube language for `nincfg.bin`.
+    pub language: nincfg::Language,
+    /// Forced video mode for `nincfg.bin`.
+    pub video_mode: nincfg::VideoMode,
+    /// Emulate a memory card.
+    pub memcard_emu: bool,
+    /// Optional Gecko cheat file path (on SD) recorded in `nincfg.bin`.
+    pub cheat_path: Option<String>,
 }
 
 /// Result of an injection.
@@ -101,6 +126,10 @@ pub struct Summary {
 /// Run the injection described by `config`, using `work_dir` as scratch space for the staged
 /// build tree. `work_dir` should be empty; callers typically pass a fresh temp directory.
 pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
+    if config.gamecube.is_some() {
+        return run_gamecube(config, work_dir);
+    }
+
     log::info!("opening source disc {}", config.input.display());
     let mut source = SourceDisc::open(&config.input)?;
     let game_id = source.game_id_str();
@@ -159,7 +188,7 @@ pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
     std::fs::write(&meta_path, patched).map_err(|e| Error::io(&meta_path, e))?;
 
     // 7. Boot textures (icon / TV / DRC).
-    resolve_textures(&config, &game_id, &staged.meta_dir)?;
+    resolve_textures(&config, "wii", &game_id, &staged.meta_dir)?;
 
     // 8. Package.
     log::info!("packaging WUP into {}", config.out.display());
@@ -171,6 +200,131 @@ pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
         cert: &config.cert,
     };
     let package = build_package(work_dir, &config.out, &params)?;
+
+    Ok(Summary {
+        title_id: ids.title_id,
+        game_id,
+        title,
+        package,
+        out: config.out.clone(),
+    })
+}
+
+/// Run a GameCube injection: author a synthetic Wii disc that boots Nintendont (with the game as
+/// `files/game.iso`), then reuse the Wii pipeline's NFS/packaging back half. Also emits an
+/// `nincfg.bin` next to the output for the user's SD card.
+fn run_gamecube(mut config: Config, work_dir: &Path) -> Result<Summary> {
+    let gc_opts = config
+        .gamecube
+        .take()
+        .expect("run() dispatches here only when gamecube options are present");
+
+    log::info!("opening GameCube image {}", config.input.display());
+    let mut gc = GcImage::open(&config.input)?;
+    let game_id = gc.game_id_str();
+    let game_id4 = gc.disc_id4();
+    let ids = titleid::derive(game_id4);
+    let iso_size = gc.iso_size();
+
+    // 1. Stage the base title.
+    log::info!("staging base title");
+    let staged = config.base.stage(work_dir)?;
+
+    // 2. Author the synthetic Wii disc (Nintendont as main.dol + the GameCube image as game.iso).
+    if gc_opts.apploader.is_empty() {
+        log::warn!(
+            "no apploader supplied: the package will validate but will NOT boot on hardware \
+             (supply one with --apploader)"
+        );
+    }
+    let disc_title = config.title.clone().unwrap_or_else(|| game_id.clone());
+    let disc_path = work_dir.join("gc_disc.img");
+    log::info!(
+        "authoring synthetic Wii disc (embedding {} MiB game.iso)…",
+        iso_size / (1024 * 1024)
+    );
+    let inputs = GcDiscInputs {
+        game_id: gc.game_id(),
+        disc_title: &disc_title,
+        main_dol: &gc_opts.nintendont_dol,
+        apploader: &gc_opts.apploader,
+        title_id: ids.title_id,
+    };
+    let mut authored = wii_author::author_gc_disc(gc.iso_stream(), iso_size, &inputs, &disc_path)?;
+
+    // 3. Convert to NFS under content/, rebuilding the Wii hash tree.
+    log::info!("building NFS (this reads the whole disc)…");
+    let plan = authored.plan.clone();
+    let nfs_stats = build_nfs(&mut authored, &staged.htk, &staged.content_dir, &plan)?;
+    log::info!(
+        "NFS: {} file(s), {} bytes",
+        nfs_stats.file_count,
+        nfs_stats.total_bytes
+    );
+
+    // 4. Write the synthetic disc's Wii ticket/TMD as rvlt.tik / rvlt.tmd.
+    let tik_path = staged.code_dir.join("rvlt.tik");
+    std::fs::write(&tik_path, &authored.rvlt_ticket).map_err(|e| Error::io(&tik_path, e))?;
+    let tmd_path = staged.code_dir.join("rvlt.tmd");
+    std::fs::write(&tmd_path, &authored.rvlt_tmd).map_err(|e| Error::io(&tmd_path, e))?;
+
+    // 5. Patch fw.img: fakesign + homebrew (AHBPROT/MEMPROT) so Nintendont gets hardware access.
+    fwimg::patch_file(&staged.code_dir.join("fw.img"), fwimg::HOMEBREW_PATCHES)?;
+
+    // 6. Metadata: app.xml + meta.xml.
+    std::fs::write(staged.code_dir.join("app.xml"), appxml::generate(&ids))
+        .map_err(|e| Error::io(staged.code_dir.join("app.xml"), e))?;
+
+    let title = resolve_title(&config, &game_id);
+    let meta_path = staged.meta_dir.join("meta.xml");
+    let base_meta = std::fs::read_to_string(&meta_path).map_err(|e| Error::io(&meta_path, e))?;
+    let patched = patch_meta(
+        &base_meta,
+        &MetaOptions {
+            ids: &ids,
+            long_name: &title,
+            short_name: &title,
+            publisher: "",
+            region: config.region.code(),
+            drc_use: config.gamepad,
+        },
+    )?;
+    std::fs::write(&meta_path, patched).map_err(|e| Error::io(&meta_path, e))?;
+
+    // 7. Boot textures (GameCube art repository; UWUVCI-IMAGES keys GameCube under "gcn").
+    resolve_textures(&config, "gcn", &game_id, &staged.meta_dir)?;
+
+    // 8. Package.
+    log::info!("packaging WUP into {}", config.out.display());
+    let params = PackageParams {
+        title_id: ids.title_id,
+        group_id: (ids.group_id & 0xFFFF) as u16,
+        wiiu_common_key: config.wiiu_common_key.0,
+        title_key: TITLE_KEY,
+        cert: &config.cert,
+    };
+    let package = build_package(work_dir, &config.out, &params)?;
+
+    // 9. Emit nincfg.bin next to the output package (it belongs at the SD-card root, not in the WUP).
+    let nincfg = nincfg::generate(&NincfgOptions {
+        game_id: game_id4,
+        widescreen: gc_opts.widescreen,
+        language: gc_opts.language,
+        video_mode: gc_opts.video_mode,
+        memcard_emu: gc_opts.memcard_emu,
+        cheat_path: gc_opts.cheat_path.clone(),
+        ..Default::default()
+    });
+    let nincfg_path = config
+        .out
+        .parent()
+        .unwrap_or(config.out.as_path())
+        .join("nincfg.bin");
+    std::fs::write(&nincfg_path, nincfg).map_err(|e| Error::io(&nincfg_path, e))?;
+    log::info!(
+        "wrote {} — copy it to your SD card root for Nintendont",
+        nincfg_path.display()
+    );
 
     Ok(Summary {
         title_id: ids.title_id,
@@ -194,7 +348,7 @@ fn resolve_title(config: &Config, game_id: &str) -> String {
 }
 
 /// Write a boot texture from a user-supplied PNG, an online download, or leave the base's.
-fn resolve_textures(config: &Config, game_id: &str, meta_dir: &Path) -> Result<()> {
+fn resolve_textures(config: &Config, platform: &str, game_id: &str, meta_dir: &Path) -> Result<()> {
     let jobs = [
         (BootTexture::Icon, &config.icon_png),
         (BootTexture::BootTv, &config.boot_tv_png),
@@ -204,7 +358,7 @@ fn resolve_textures(config: &Config, game_id: &str, meta_dir: &Path) -> Result<(
         let png_bytes = if let Some(path) = override_png {
             Some(std::fs::read(path).map_err(|e| Error::io(path, e))?)
         } else if config.online {
-            artrepo::download_texture("wii", game_id, tex).unwrap_or(None)
+            artrepo::download_texture(platform, game_id, tex).unwrap_or(None)
         } else {
             None
         };
