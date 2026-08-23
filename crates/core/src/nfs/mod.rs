@@ -15,10 +15,14 @@ pub mod split;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::disc_patch::{apply_edits_to_group, recompute_group, DiscPlan, PartitionPlan};
 use crate::error::{Error, Result};
 use crate::input::{SourceDisc, DISC_SECTOR_SIZE};
 use eggs::{EggsHeader, LbaRange};
 use split::SplitWriter;
+
+/// Clusters per Wii hash group (must match [`crate::disc_patch`]).
+const SECTORS_PER_GROUP: usize = 64;
 
 /// Outcome of an NFS build.
 #[derive(Debug, Clone)]
@@ -63,8 +67,16 @@ fn structural_ranges(source: &SourceDisc) -> Vec<LbaRange> {
 
 /// Build the NFS files for `source` into `out_dir` using the 16-byte `htk` key.
 ///
-/// `out_dir` must already exist. Returns statistics about the files written.
-pub fn build_nfs(source: &mut SourceDisc, htk: &[u8; 16], out_dir: &Path) -> Result<NfsStats> {
+/// `out_dir` must already exist. `plan` (from [`crate::disc_patch::plan_disc`]) drives the
+/// per-partition Wii hash-tree rebuild — RVZ/WIA sources zero the per-cluster hash blocks, so
+/// they are recomputed here — and any `main.dol` video patches. Returns statistics about the
+/// files written.
+pub fn build_nfs(
+    source: &mut SourceDisc,
+    htk: &[u8; 16],
+    out_dir: &Path,
+    plan: &DiscPlan,
+) -> Result<NfsStats> {
     let ranges = structural_ranges(source);
     let header = EggsHeader::new(ranges.clone())?;
 
@@ -76,11 +88,25 @@ pub fn build_nfs(source: &mut SourceDisc, htk: &[u8; 16], out_dir: &Path) -> Res
     let disc = source.stream();
 
     for range in &ranges {
-        for s in range.start_sector..range.start_sector + range.num_sectors {
-            let offset = s as u64 * DISC_SECTOR_SIZE as u64;
-            read_sector(disc, offset, disc_size, &mut sector)?;
-            crypto::encrypt_sector(htk, s, &mut sector);
-            writer.write_all(&sector)?;
+        match plan
+            .partitions
+            .iter()
+            .find(|p| p.start_sector == range.start_sector)
+        {
+            Some(pp) => write_partition(&mut writer, disc, htk, pp, disc_size)?,
+            None => {
+                // Disc header / partition table: copied verbatim.
+                for s in range.start_sector..range.start_sector + range.num_sectors {
+                    read_sector(
+                        disc,
+                        s as u64 * DISC_SECTOR_SIZE as u64,
+                        disc_size,
+                        &mut sector,
+                    )?;
+                    crypto::encrypt_sector(htk, s, &mut sector);
+                    writer.write_all(&sector)?;
+                }
+            }
         }
     }
 
@@ -91,6 +117,72 @@ pub fn build_nfs(source: &mut SourceDisc, htk: &[u8; 16], out_dir: &Path) -> Res
         total_bytes,
         ranges,
     })
+}
+
+/// Write one partition: its pre-data header region verbatim (with `header_patches` spliced in),
+/// then its cluster data with the Wii hash tree rebuilt group-by-group and `main.dol` edits
+/// applied.
+fn write_partition<R: Read + Seek>(
+    writer: &mut SplitWriter,
+    disc: &mut R,
+    htk: &[u8; 16],
+    pp: &PartitionPlan,
+    disc_size: u64,
+) -> Result<()> {
+    let mut sector = vec![0u8; DISC_SECTOR_SIZE];
+
+    // Pre-data header region (ticket/TMD/cert/H3 table), verbatim + patches.
+    for s in pp.start_sector..pp.data_start_sector {
+        let sec_start = s as u64 * DISC_SECTOR_SIZE as u64;
+        read_sector(disc, sec_start, disc_size, &mut sector)?;
+        for (off, bytes) in &pp.header_patches {
+            splice(&mut sector, sec_start, *off, bytes);
+        }
+        crypto::encrypt_sector(htk, s, &mut sector);
+        writer.write_all(&sector)?;
+    }
+
+    // Cluster region: rebuild the hash tree one 64-cluster group at a time.
+    let total = (pp.data_end_sector - pp.data_start_sector) as u64;
+    let ngroups = total.div_ceil(SECTORS_PER_GROUP as u64);
+    let mut clusters = vec![[0u8; DISC_SECTOR_SIZE]; SECTORS_PER_GROUP];
+    for g in 0..ngroups {
+        for (k, cluster) in clusters.iter_mut().enumerate() {
+            let ps = g * SECTORS_PER_GROUP as u64 + k as u64;
+            if ps < total {
+                let off = (pp.data_start_sector as u64 + ps) * DISC_SECTOR_SIZE as u64;
+                read_sector(disc, off, disc_size, cluster)?;
+            } else {
+                cluster.fill(0);
+            }
+        }
+        apply_edits_to_group(&mut clusters, g as u32, &pp.edits);
+        recompute_group(&mut clusters);
+        for (k, cluster) in clusters.iter_mut().enumerate() {
+            let ps = g * SECTORS_PER_GROUP as u64 + k as u64;
+            if ps < total {
+                let s = pp.data_start_sector + ps as u32;
+                crypto::encrypt_sector(htk, s, cluster);
+                writer.write_all(cluster)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Overlay `bytes` (which live at absolute disc offset `patch_off`) onto `sector`, whose first
+/// byte is at absolute disc offset `sec_start`. No-op if they do not overlap.
+fn splice(sector: &mut [u8], sec_start: u64, patch_off: u64, bytes: &[u8]) {
+    let sec_end = sec_start + sector.len() as u64;
+    let p_end = patch_off + bytes.len() as u64;
+    let ov_start = sec_start.max(patch_off);
+    let ov_end = sec_end.min(p_end);
+    if ov_start < ov_end {
+        let dst = (ov_start - sec_start) as usize;
+        let src = (ov_start - patch_off) as usize;
+        let len = (ov_end - ov_start) as usize;
+        sector[dst..dst + len].copy_from_slice(&bytes[src..src + len]);
+    }
 }
 
 /// Read one 0x8000 sector at `offset` from the decrypted disc, zero-padding a short/OOB read.
@@ -116,15 +208,19 @@ fn read_sector<R: Read + Seek>(
 mod tests {
     use super::*;
 
-    /// End-to-end round-trip oracle: encode a real Wii disc to NFS, then read it back with
-    /// `nod` and confirm every stored sector matches the source disc byte-for-byte.
+    /// End-to-end oracle: encode a real Wii disc to NFS (rebuilding the Wii hash tree), then
+    /// reopen it with `nod`'s hash **validation** enabled and confirm the whole data partition
+    /// reads without a hash error and its logical bytes match the source. This proves the
+    /// rebuilt H0/H1/H2 blocks and H3 tables are internally consistent (the property a real VC
+    /// checks) — which a plain byte round-trip could not, since RVZ zeroes the source hashes.
     ///
     /// Uses `test_titles/Wii Sports (USA).rvz` if present; skipped otherwise. Ignored by
     /// default because it reads several GB — run with `cargo test --release -- --ignored`.
     #[test]
     #[ignore = "reads multi-GB disc; run manually with the test title present"]
-    fn nfs_round_trips_through_nod() {
-        use sha1::{Digest, Sha1};
+    fn nfs_rebuilds_valid_wii_hashes() {
+        use crate::disc_patch::plan_disc;
+        use crate::video::VideoPatches;
 
         let title = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_titles/Wii Sports (USA).rvz");
@@ -133,52 +229,38 @@ mod tests {
             return;
         }
 
-        let htk = [0x5Au8; 16]; // arbitrary key: encoder and reader share it, so any key round-trips
+        let htk = [0x5Au8; 16]; // arbitrary key: encoder and reader share it
         let out = tempfile::tempdir().unwrap();
 
-        // Encode.
         let mut source = SourceDisc::open(&title).unwrap();
-        let ranges = structural_ranges(&source);
-        let stats = build_nfs(&mut source, &htk, out.path()).unwrap();
-        assert_eq!(stats.ranges, ranges);
-
-        // nod's NFS reader looks for the key at ../code/htk.bin or ./htk.bin.
+        let plan = plan_disc(&mut source, &VideoPatches::default()).unwrap();
+        build_nfs(&mut source, &htk, out.path(), &plan).unwrap();
         std::fs::write(out.path().join("htk.bin"), htk).unwrap();
 
-        // Hash the covered sectors from the source disc.
-        let mut source = SourceDisc::open(&title).unwrap();
-        let disc_size = source.disc_size();
-        let src_hash = hash_ranges(source.stream(), disc_size, &ranges);
+        // Read the source's logical data-partition bytes.
+        let src = SourceDisc::open(&title).unwrap();
+        let mut src_part = src.open_data_partition().unwrap();
+        let mut src_data = Vec::new();
+        src_part.read_to_end(&mut src_data).unwrap();
 
-        // Hash the same logical sectors read back from the NFS via nod.
+        // Reopen the NFS with hash validation on; any invalid H0/H1/H2/H3 fails the read.
         let nfs = nod::Disc::new_with_options(
             out.path().join("hif_000000.nfs"),
             &nod::OpenOptions {
                 rebuild_encryption: false,
-                ..Default::default()
+                validate_hashes: true,
             },
         )
         .unwrap();
-        let nfs_size = nfs.disc_size();
-        let mut nfs_stream = nfs;
-        let nfs_hash = hash_ranges(&mut nfs_stream, nfs_size, &ranges);
+        let mut nfs_part = nfs.open_partition_kind(nod::PartitionKind::Data).unwrap();
+        let mut nfs_data = Vec::new();
+        nfs_part
+            .read_to_end(&mut nfs_data)
+            .expect("reading the rebuilt NFS must not raise a hash-validation error");
 
         assert_eq!(
-            src_hash, nfs_hash,
-            "NFS round-trip through nod must be lossless"
+            src_data, nfs_data,
+            "logical data must be preserved through the rebuild"
         );
-
-        fn hash_ranges<R: Read + Seek>(disc: &mut R, size: u64, ranges: &[LbaRange]) -> [u8; 20] {
-            let mut hasher = Sha1::new();
-            let mut buf = vec![0u8; DISC_SECTOR_SIZE];
-            for range in ranges {
-                for s in range.start_sector..range.start_sector + range.num_sectors {
-                    let offset = s as u64 * DISC_SECTOR_SIZE as u64;
-                    read_sector(disc, offset, size, &mut buf).unwrap();
-                    hasher.update(&buf);
-                }
-            }
-            hasher.finalize().into()
-        }
     }
 }

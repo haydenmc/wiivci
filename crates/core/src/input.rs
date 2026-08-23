@@ -10,11 +10,24 @@
 //! available (see [`crate::keys`]). We additionally extract the game partition's `ticket.bin`
 //! and `tmd.bin`, which become `code/rvlt.tik` / `code/rvlt.tmd` in the output package.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use nod::{Disc, OpenOptions, PartitionKind, SECTOR_SIZE};
 
 use crate::error::{Error, Result};
+
+fn be32(b: &[u8]) -> u32 {
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// The data partition's `main.dol` and its offset within the decrypted partition data.
+pub struct MainDol {
+    /// Logical offset of `main.dol` within the decrypted data partition.
+    pub offset: u64,
+    /// The `main.dol` bytes.
+    pub data: Vec<u8>,
+}
 
 /// Size of a Wii/GC disc sector: 0x8000 bytes. Re-exported from `nod` for convenience.
 pub const DISC_SECTOR_SIZE: usize = SECTOR_SIZE;
@@ -37,6 +50,8 @@ pub struct SourceDisc {
 /// The sector range occupied by a partition on the logical disc.
 #[derive(Clone, Copy, Debug)]
 pub struct PartitionSpan {
+    /// `nod` partition index (for [`SourceDisc::partition_h3_table`]).
+    pub index: usize,
     /// First sector of the partition (its header/ticket/tmd).
     pub start_sector: u32,
     /// First sector of the (now-decrypted) partition data.
@@ -68,6 +83,7 @@ impl SourceDisc {
 
         // Collect every partition span; identify the data (game) partition.
         let span_of = |p: &nod::PartitionInfo| PartitionSpan {
+            index: p.index,
             start_sector: p.start_sector,
             data_start_sector: p.data_start_sector,
             data_end_sector: p.data_end_sector,
@@ -162,6 +178,59 @@ impl SourceDisc {
     /// The path the disc was opened from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Open the data partition for logical (hash-stripped) reads.
+    pub fn open_data_partition(&self) -> Result<Box<dyn nod::PartitionBase>> {
+        Ok(self.disc.open_partition_kind(PartitionKind::Data)?)
+    }
+
+    /// The (valid) H3 table for the partition with `nod` index `index`.
+    ///
+    /// `nod` reads it from the partition header, so it is correct even for RVZ/WIA inputs that
+    /// zero the per-cluster hash blocks — [`crate::disc_patch`] uses it as the base H3 table when
+    /// rebuilding those blocks.
+    pub fn partition_h3_table(&self, index: usize) -> Result<Vec<u8>> {
+        let mut part = self.disc.open_partition(index)?;
+        let meta = part.meta()?;
+        meta.raw_h3_table
+            .as_ref()
+            .map(|v| v.to_vec())
+            .ok_or_else(|| Error::UnsupportedDisc(format!("partition {index} has no H3 table")))
+    }
+
+    /// Read the data partition's `main.dol` (executable) and its logical offset.
+    ///
+    /// The offset is read from `boot.bin` (`0x420`, stored `>> 2`); the size is derived from
+    /// the DOL header's 18 sections. Both are in the partition's logical (hash-stripped) data
+    /// address space, which [`crate::disc_patch`] maps back to physical clusters.
+    pub fn read_main_dol(&self) -> Result<MainDol> {
+        let ioerr = |e| Error::io("<partition>", e);
+        let mut part = self.disc.open_partition_kind(PartitionKind::Data)?;
+
+        let mut boot = [0u8; 0x440];
+        part.seek(SeekFrom::Start(0)).map_err(ioerr)?;
+        part.read_exact(&mut boot).map_err(ioerr)?;
+        let dol_off = (be32(&boot[0x420..]) as u64) << 2;
+
+        let mut header = [0u8; 0x100];
+        part.seek(SeekFrom::Start(dol_off)).map_err(ioerr)?;
+        part.read_exact(&mut header).map_err(ioerr)?;
+        // DOL: 18 sections (7 text + 11 data); offsets at 0x00.., sizes at 0x90.. .
+        let mut size = 0x100u64;
+        for i in 0..18 {
+            let off = be32(&header[i * 4..]) as u64;
+            let sz = be32(&header[0x90 + i * 4..]) as u64;
+            size = size.max(off + sz);
+        }
+
+        let mut data = vec![0u8; size as usize];
+        part.seek(SeekFrom::Start(dol_off)).map_err(ioerr)?;
+        part.read_exact(&mut data).map_err(ioerr)?;
+        Ok(MainDol {
+            offset: dol_off,
+            data,
+        })
     }
 
     /// Mutable access to the underlying decrypted disc stream (`Read + Seek`).
