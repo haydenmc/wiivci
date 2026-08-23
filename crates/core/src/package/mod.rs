@@ -58,7 +58,11 @@ fn assemble_content(c: &content::PlannedContent, fst: &[u8]) -> Result<Vec<u8>> 
 }
 
 /// Build a complete installable WUP package from a staged build directory into `out_dir`.
-pub fn build_package(build_dir: &Path, out_dir: &Path, params: &PackageParams) -> Result<PackageStats> {
+pub fn build_package(
+    build_dir: &Path,
+    out_dir: &Path,
+    params: &PackageParams,
+) -> Result<PackageStats> {
     fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
     let plan = content::plan(build_dir)?;
 
@@ -104,5 +108,8 @@ pub fn build_package(build_dir: &Path, out_dir: &Path, params: &PackageParams) -
     fs::write(out_dir.join("title.cert"), params.cert.as_bytes())
         .map_err(|e| Error::io(out_dir.join("title.cert"), e))?;
 
-    Ok(PackageStats { content_count: plan.contents.len(), total_content_bytes })
+    Ok(PackageStats {
+        content_count: plan.contents.len(),
+        total_content_bytes,
+    })
 }

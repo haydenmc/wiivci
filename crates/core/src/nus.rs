@@ -44,7 +44,10 @@ impl NusClient {
             .timeout(Duration::from_secs(120))
             .build()
             .map_err(|e| Error::Other(anyhow::anyhow!("building HTTP client: {e}")))?;
-        Ok(NusClient { base_url: base_url.into().trim_end_matches('/').to_string(), http })
+        Ok(NusClient {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            http,
+        })
     }
 
     fn get(&self, title_id: u64, file: &str) -> Result<Vec<u8>> {
@@ -55,9 +58,14 @@ impl NusClient {
             .send()
             .map_err(|e| Error::Other(anyhow::anyhow!("GET {url}: {e}")))?;
         if !resp.status().is_success() {
-            return Err(Error::Other(anyhow::anyhow!("GET {url}: HTTP {}", resp.status())));
+            return Err(Error::Other(anyhow::anyhow!(
+                "GET {url}: HTTP {}",
+                resp.status()
+            )));
         }
-        let bytes = resp.bytes().map_err(|e| Error::Other(anyhow::anyhow!("reading {url}: {e}")))?;
+        let bytes = resp
+            .bytes()
+            .map_err(|e| Error::Other(anyhow::anyhow!("reading {url}: {e}")))?;
         Ok(bytes.to_vec())
     }
 
@@ -99,7 +107,13 @@ impl NusBase {
         version: Option<u32>,
         client: NusClient,
     ) -> Self {
-        NusBase { title_id, enc_title_key, wiiu_common_key, version, client }
+        NusBase {
+            title_id,
+            enc_title_key,
+            wiiu_common_key,
+            version,
+            client,
+        }
     }
 }
 
@@ -110,7 +124,8 @@ impl BaseSource for NusBase {
         let records = parse_content_records(&tmd)
             .map_err(|e| Error::UnsupportedDisc(format!("parsing NUS TMD: {e}")))?;
 
-        let title_key = decrypt_title_key(&self.wiiu_common_key, self.title_id, &self.enc_title_key);
+        let title_key =
+            decrypt_title_key(&self.wiiu_common_key, self.title_id, &self.enc_title_key);
 
         // Download each referenced content on demand, once, caching in memory. Contents that
         // hold only the base's hif_*.nfs are never requested (extract skips those files).
@@ -153,7 +168,9 @@ mod tests {
         if !base.join("code/app.xml").exists() {
             return;
         }
-        let Ok(hex) = std::env::var("WIIU_COMMON_KEY") else { return };
+        let Ok(hex) = std::env::var("WIIU_COMMON_KEY") else {
+            return;
+        };
         let mut common = [0u8; 16];
         for i in 0..16 {
             common[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();

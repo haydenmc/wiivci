@@ -126,7 +126,10 @@ fn build_base(cli: &Cli, wiiu_common_key: &WiiUCommonKey) -> Result<Box<dyn Base
         return open_base(path).with_context(|| format!("opening base {}", path.display()));
     }
     // NUS path (validated present by the arg group).
-    let title_id_hex = cli.base_title_id.as_ref().expect("arg group guarantees this");
+    let title_id_hex = cli
+        .base_title_id
+        .as_ref()
+        .expect("arg group guarantees this");
     let title_id = u64::from_str_radix(title_id_hex.trim(), 16)
         .with_context(|| format!("invalid --base-title-id {title_id_hex:?}"))?;
     let key_hex = cli

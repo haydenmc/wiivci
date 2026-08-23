@@ -85,7 +85,8 @@ impl Fst {
         let mut out = Vec::new();
         out.extend_from_slice(b"FST\0");
         out.write_u32::<BigEndian>(self.offset_factor).unwrap();
-        out.write_u32::<BigEndian>(self.contents.len() as u32).unwrap();
+        out.write_u32::<BigEndian>(self.contents.len() as u32)
+            .unwrap();
         // 0x0C..0x20 is zero in retail FSTs (the wiki's "0x0100" here does not match).
         out.extend_from_slice(&[0u8; 20]);
 
@@ -109,14 +110,20 @@ impl Fst {
 
         for (node, &name_off) in self.nodes.iter().zip(&name_offsets) {
             let (dir_bit, offset, size) = match node.kind {
-                FstNodeKind::File { offset, size } => {
-                    (0x00u8, (offset / self.offset_factor as u64) as u32, size as u32)
-                }
-                FstNodeKind::Dir { parent_index, end_index } => (0x01u8, parent_index, end_index),
+                FstNodeKind::File { offset, size } => (
+                    0x00u8,
+                    (offset / self.offset_factor as u64) as u32,
+                    size as u32,
+                ),
+                FstNodeKind::Dir {
+                    parent_index,
+                    end_index,
+                } => (0x01u8, parent_index, end_index),
             };
             out.write_u8(dir_bit | node.type_flags).unwrap();
             out.write_u8((name_off >> 16) as u8).unwrap();
-            out.write_u16::<BigEndian>((name_off & 0xFFFF) as u16).unwrap();
+            out.write_u16::<BigEndian>((name_off & 0xFFFF) as u16)
+                .unwrap();
             out.write_u32::<BigEndian>(offset).unwrap();
             out.write_u32::<BigEndian>(size).unwrap();
             out.write_u16::<BigEndian>(node.flags).unwrap();
@@ -156,7 +163,10 @@ impl Fst {
 
         let read_name = |name_off: u32| -> String {
             let start = name_table + name_off as usize;
-            let end = data[start..].iter().position(|&b| b == 0).map_or(data.len(), |p| start + p);
+            let end = data[start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map_or(data.len(), |p| start + p);
             String::from_utf8_lossy(&data[start..end]).into_owned()
         };
 
@@ -164,21 +174,38 @@ impl Fst {
         for i in 0..root_size {
             let o = entries_start + i * 0x10;
             let type_byte = data[o];
-            let name_off = ((data[o + 1] as u32) << 16) | BigEndian::read_u16(&data[o + 2..o + 4]) as u32;
+            let name_off =
+                ((data[o + 1] as u32) << 16) | BigEndian::read_u16(&data[o + 2..o + 4]) as u32;
             let offset = BigEndian::read_u32(&data[o + 4..o + 8]);
             let size = BigEndian::read_u32(&data[o + 8..o + 12]);
             let flags = BigEndian::read_u16(&data[o + 12..o + 14]);
             let cluster = BigEndian::read_u16(&data[o + 14..o + 16]);
             let kind = if type_byte & 0x01 != 0 {
-                FstNodeKind::Dir { parent_index: offset, end_index: size }
+                FstNodeKind::Dir {
+                    parent_index: offset,
+                    end_index: size,
+                }
             } else {
-                FstNodeKind::File { offset: offset as u64 * offset_factor as u64, size: size as u64 }
+                FstNodeKind::File {
+                    offset: offset as u64 * offset_factor as u64,
+                    size: size as u64,
+                }
             };
             let type_flags = type_byte & !0x01;
-            nodes.push(FstNode { name: read_name(name_off), kind, type_flags, flags, cluster });
+            nodes.push(FstNode {
+                name: read_name(name_off),
+                kind,
+                type_flags,
+                flags,
+                cluster,
+            });
         }
 
-        Some(Fst { offset_factor, contents, nodes })
+        Some(Fst {
+            offset_factor,
+            contents,
+            nodes,
+        })
     }
 }
 
@@ -187,7 +214,8 @@ mod tests {
     use super::*;
 
     fn reference_fst_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev/wup_ref/fst_decrypted.bin")
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.dev/wup_ref/fst_decrypted.bin")
     }
 
     #[test]
@@ -195,13 +223,52 @@ mod tests {
         let fst = Fst {
             offset_factor: OFFSET_FACTOR,
             contents: vec![
-                FstContent { offset_sectors: 0, size_sectors: 0, owner_title_id: 0, group_id: 0, flags: 0x0100 },
-                FstContent { offset_sectors: 2, size_sectors: 1, owner_title_id: 0, group_id: 0x400, flags: 0x0200 },
+                FstContent {
+                    offset_sectors: 0,
+                    size_sectors: 0,
+                    owner_title_id: 0,
+                    group_id: 0,
+                    flags: 0x0100,
+                },
+                FstContent {
+                    offset_sectors: 2,
+                    size_sectors: 1,
+                    owner_title_id: 0,
+                    group_id: 0x400,
+                    flags: 0x0200,
+                },
             ],
             nodes: vec![
-                FstNode { name: String::new(), kind: FstNodeKind::Dir { parent_index: 0, end_index: 3 }, type_flags: 0, flags: 0, cluster: 0 },
-                FstNode { name: "meta".into(), kind: FstNodeKind::Dir { parent_index: 0, end_index: 3 }, type_flags: 0, flags: 0x0040, cluster: 1 },
-                FstNode { name: "meta.xml".into(), kind: FstNodeKind::File { offset: 0, size: 9518 }, type_flags: 0, flags: 0x0040, cluster: 1 },
+                FstNode {
+                    name: String::new(),
+                    kind: FstNodeKind::Dir {
+                        parent_index: 0,
+                        end_index: 3,
+                    },
+                    type_flags: 0,
+                    flags: 0,
+                    cluster: 0,
+                },
+                FstNode {
+                    name: "meta".into(),
+                    kind: FstNodeKind::Dir {
+                        parent_index: 0,
+                        end_index: 3,
+                    },
+                    type_flags: 0,
+                    flags: 0x0040,
+                    cluster: 1,
+                },
+                FstNode {
+                    name: "meta.xml".into(),
+                    kind: FstNodeKind::File {
+                        offset: 0,
+                        size: 9518,
+                    },
+                    type_flags: 0,
+                    flags: 0x0040,
+                    cluster: 1,
+                },
             ],
         };
         let bytes = fst.serialize();
@@ -234,8 +301,15 @@ mod tests {
                 &ours[s..(s + 16).min(ours.len())]
             );
         }
-        assert_eq!(&data[..ours.len()], ours.as_slice(), "serialized FST differs from reference");
+        assert_eq!(
+            &data[..ours.len()],
+            ours.as_slice(),
+            "serialized FST differs from reference"
+        );
         // The remainder of the reference is zero padding to the content size.
-        assert!(data[ours.len()..].iter().all(|&b| b == 0), "trailing bytes should be padding");
+        assert!(
+            data[ours.len()..].iter().all(|&b| b == 0),
+            "trailing bytes should be padding"
+        );
     }
 }

@@ -43,8 +43,14 @@ pub struct NfsStats {
 /// the data partition alone is a future size optimization.
 fn structural_ranges(source: &SourceDisc) -> Vec<LbaRange> {
     let mut ranges = vec![
-        LbaRange { start_sector: 0, num_sectors: 1 },
-        LbaRange { start_sector: 8, num_sectors: 2 },
+        LbaRange {
+            start_sector: 0,
+            num_sectors: 1,
+        },
+        LbaRange {
+            start_sector: 8,
+            num_sectors: 2,
+        },
     ];
     for span in source.partitions() {
         ranges.push(LbaRange {
@@ -80,7 +86,11 @@ pub fn build_nfs(source: &mut SourceDisc, htk: &[u8; 16], out_dir: &Path) -> Res
 
     let total_bytes = writer.total_written();
     let file_count = writer.finish()?;
-    Ok(NfsStats { file_count, total_bytes, ranges })
+    Ok(NfsStats {
+        file_count,
+        total_bytes,
+        ranges,
+    })
 }
 
 /// Read one 0x8000 sector at `offset` from the decrypted disc, zero-padding a short/OOB read.
@@ -94,9 +104,11 @@ fn read_sector<R: Read + Seek>(
     if offset >= disc_size {
         return Ok(());
     }
-    disc.seek(SeekFrom::Start(offset)).map_err(|e| Error::io("<disc>", e))?;
+    disc.seek(SeekFrom::Start(offset))
+        .map_err(|e| Error::io("<disc>", e))?;
     let to_read = ((disc_size - offset) as usize).min(out.len());
-    disc.read_exact(&mut out[..to_read]).map_err(|e| Error::io("<disc>", e))?;
+    disc.read_exact(&mut out[..to_read])
+        .map_err(|e| Error::io("<disc>", e))?;
     Ok(())
 }
 
@@ -141,14 +153,20 @@ mod tests {
         // Hash the same logical sectors read back from the NFS via nod.
         let nfs = nod::Disc::new_with_options(
             out.path().join("hif_000000.nfs"),
-            &nod::OpenOptions { rebuild_encryption: false, ..Default::default() },
+            &nod::OpenOptions {
+                rebuild_encryption: false,
+                ..Default::default()
+            },
         )
         .unwrap();
         let nfs_size = nfs.disc_size();
         let mut nfs_stream = nfs;
         let nfs_hash = hash_ranges(&mut nfs_stream, nfs_size, &ranges);
 
-        assert_eq!(src_hash, nfs_hash, "NFS round-trip through nod must be lossless");
+        assert_eq!(
+            src_hash, nfs_hash,
+            "NFS round-trip through nod must be lossless"
+        );
 
         fn hash_ranges<R: Read + Seek>(disc: &mut R, size: u64, ranges: &[LbaRange]) -> [u8; 20] {
             let mut hasher = Sha1::new();

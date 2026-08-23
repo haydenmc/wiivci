@@ -71,7 +71,9 @@ impl EggsHeader {
             cursor.write_u32::<BigEndian>(VERSION).unwrap();
             cursor.write_u32::<BigEndian>(0).unwrap(); // unk1
             cursor.write_u32::<BigEndian>(0).unwrap(); // unk2
-            cursor.write_u32::<BigEndian>(self.ranges.len() as u32).unwrap();
+            cursor
+                .write_u32::<BigEndian>(self.ranges.len() as u32)
+                .unwrap();
             for range in &self.ranges {
                 cursor.write_u32::<BigEndian>(range.start_sector).unwrap();
                 cursor.write_u32::<BigEndian>(range.num_sectors).unwrap();
@@ -91,9 +93,18 @@ mod tests {
     #[test]
     fn header_layout_is_correct() {
         let header = EggsHeader::new(vec![
-            LbaRange { start_sector: 0, num_sectors: 1 },
-            LbaRange { start_sector: 8, num_sectors: 2 },
-            LbaRange { start_sector: 10, num_sectors: 0x1234 },
+            LbaRange {
+                start_sector: 0,
+                num_sectors: 1,
+            },
+            LbaRange {
+                start_sector: 8,
+                num_sectors: 2,
+            },
+            LbaRange {
+                start_sector: 10,
+                num_sectors: 0x1234,
+            },
         ])
         .unwrap();
         let bytes = header.to_bytes();
@@ -103,7 +114,7 @@ mod tests {
         assert_eq!(&bytes[8..12], &[0, 0, 0, 0]);
         assert_eq!(&bytes[12..16], &[0, 0, 0, 0]);
         assert_eq!(&bytes[16..20], &[0, 0, 0, 3]); // num ranges
-        // range 0
+                                                   // range 0
         assert_eq!(&bytes[20..24], &[0, 0, 0, 0]);
         assert_eq!(&bytes[24..28], &[0, 0, 0, 1]);
         // range 1
@@ -119,7 +130,13 @@ mod tests {
 
     #[test]
     fn too_many_ranges_rejected() {
-        let ranges = vec![LbaRange { start_sector: 0, num_sectors: 1 }; MAX_RANGES + 1];
+        let ranges = vec![
+            LbaRange {
+                start_sector: 0,
+                num_sectors: 1
+            };
+            MAX_RANGES + 1
+        ];
         assert!(EggsHeader::new(ranges).is_err());
     }
 }

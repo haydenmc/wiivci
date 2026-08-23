@@ -9,13 +9,25 @@ fn main() {
     std::fs::create_dir_all(&out).unwrap();
 
     let mut source = open_base(&base).expect("open base");
-    let staged = source.stage(std::path::Path::new(&out)).expect("stage base");
+    let staged = source
+        .stage(std::path::Path::new(&out))
+        .expect("stage base");
 
-    println!("htk.bin = {}", staged.htk.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    println!(
+        "htk.bin = {}",
+        staged
+            .htk
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
     println!("code_dir = {}", staged.code_dir.display());
     for f in REQUIRED_CODE_FILES {
         let p = staged.code_dir.join(f);
-        println!("  {f}: {} bytes", std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0));
+        println!(
+            "  {f}: {} bytes",
+            std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
+        );
     }
     for name in ["code/app.xml", "code/cos.xml", "meta/meta.xml"] {
         let p = std::path::Path::new(&out).join(name);

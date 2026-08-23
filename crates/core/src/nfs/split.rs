@@ -62,7 +62,9 @@ impl SplitWriter {
             let take = remaining.min(data.len() as u64) as usize;
             let path = Self::file_path(&self.dir, self.index);
             let writer = self.current.as_mut().expect("writer open");
-            writer.write_all(&data[..take]).map_err(|e| Error::io(&path, e))?;
+            writer
+                .write_all(&data[..take])
+                .map_err(|e| Error::io(&path, e))?;
             self.written_in_current += take as u64;
             self.total_written += take as u64;
             data = &data[take..];
@@ -71,10 +73,14 @@ impl SplitWriter {
     }
 
     /// Number of files produced so far (1-based count).
-    pub fn file_count(&self) -> u32 { self.index + 1 }
+    pub fn file_count(&self) -> u32 {
+        self.index + 1
+    }
 
     /// Total bytes written across all files (including the header).
-    pub fn total_written(&self) -> u64 { self.total_written }
+    pub fn total_written(&self) -> u64 {
+        self.total_written
+    }
 
     /// Flush and finalize; returns the number of files written.
     pub fn finish(mut self) -> Result<u32> {

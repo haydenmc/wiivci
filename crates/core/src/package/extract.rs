@@ -11,10 +11,10 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
+use super::content::TYPE_HASHED;
 use super::content_crypto::{decode_hashed, decode_nonhashed};
 use super::fst::{Fst, FstNodeKind};
 use super::tmd::ContentRecord;
-use super::content::TYPE_HASHED;
 
 /// Reads the encrypted `.app` bytes for a given content id.
 pub trait ContentReader {
@@ -45,7 +45,7 @@ fn node_paths(fst: &Fst) -> Vec<String> {
     if let Some(FstNodeKind::Dir { end_index, .. }) = fst.nodes.first().map(|n| &n.kind) {
         stack.push((*end_index, String::new()));
     }
-    for i in 1..fst.nodes.len() {
+    for (i, node) in fst.nodes.iter().enumerate().skip(1) {
         while let Some(&(end, _)) = stack.last() {
             if i as u32 >= end {
                 stack.pop();
@@ -54,8 +54,11 @@ fn node_paths(fst: &Fst) -> Vec<String> {
             }
         }
         let parent = stack.last().map(|(_, p)| p.as_str()).unwrap_or("");
-        let node = &fst.nodes[i];
-        let path = if parent.is_empty() { node.name.clone() } else { format!("{parent}/{}", node.name) };
+        let path = if parent.is_empty() {
+            node.name.clone()
+        } else {
+            format!("{parent}/{}", node.name)
+        };
         paths[i] = path.clone();
         if let FstNodeKind::Dir { end_index, .. } = node.kind {
             stack.push((end_index, path));
@@ -76,10 +79,13 @@ pub fn extract_title(
     let by_index: HashMap<u16, &ContentRecord> = records.iter().map(|r| (r.index, r)).collect();
 
     // Content index 0 is the FST.
-    let fst_rec = by_index.get(&0).ok_or_else(|| Error::UnsupportedDisc("title has no FST content".into()))?;
+    let fst_rec = by_index
+        .get(&0)
+        .ok_or_else(|| Error::UnsupportedDisc("title has no FST content".into()))?;
     let fst_cipher = reader.read(fst_rec.id)?;
     let fst_data = decode_content(fst_rec, title_key, &fst_cipher);
-    let fst = Fst::parse(&fst_data).ok_or_else(|| Error::UnsupportedDisc("could not parse title FST".into()))?;
+    let fst = Fst::parse(&fst_data)
+        .ok_or_else(|| Error::UnsupportedDisc("could not parse title FST".into()))?;
 
     let paths = node_paths(&fst);
     let mut decoded_cache: HashMap<u16, Vec<u8>> = HashMap::new();
@@ -98,7 +104,10 @@ pub fn extract_title(
                     continue;
                 }
                 let rec = by_index.get(&node.cluster).ok_or_else(|| {
-                    Error::UnsupportedDisc(format!("FST references missing content {}", node.cluster))
+                    Error::UnsupportedDisc(format!(
+                        "FST references missing content {}",
+                        node.cluster
+                    ))
                 })?;
                 let data = match decoded_cache.get(&node.cluster) {
                     Some(d) => d,
@@ -149,7 +158,9 @@ mod tests {
             eprintln!("skipping: run the stage_base example to populate .dev/base");
             return;
         }
-        let Ok(hex) = std::env::var("WIIU_COMMON_KEY") else { return };
+        let Ok(hex) = std::env::var("WIIU_COMMON_KEY") else {
+            return;
+        };
         let mut common = [0u8; 16];
         for i in 0..16 {
             common[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
@@ -172,14 +183,27 @@ mod tests {
             std::fs::read(&p).map_err(|e| Error::io(&p, e))
         };
         let out = tempfile::tempdir().unwrap();
-        extract_title(&records, &title_key, &reader, out.path(), |n| n.starts_with("hif_")).unwrap();
+        extract_title(&records, &title_key, &reader, out.path(), |n| {
+            n.starts_with("hif_")
+        })
+        .unwrap();
 
         // Every extracted file must byte-match the zarust-staged base (which also omits hif).
-        for rel in ["code/app.xml", "code/frisbiiU.rpx", "code/cos.xml", "code/htk.bin",
-                    "meta/meta.xml", "content/assets/shaders/cafe/banner.gsh"] {
-            let extracted = std::fs::read(out.path().join(rel)).unwrap_or_else(|_| panic!("missing {rel}"));
+        for rel in [
+            "code/app.xml",
+            "code/frisbiiU.rpx",
+            "code/cos.xml",
+            "code/htk.bin",
+            "meta/meta.xml",
+            "content/assets/shaders/cafe/banner.gsh",
+        ] {
+            let extracted =
+                std::fs::read(out.path().join(rel)).unwrap_or_else(|_| panic!("missing {rel}"));
             let expected = std::fs::read(base.join(rel)).unwrap();
-            assert_eq!(extracted, expected, "extracted {rel} differs from the .wua-staged base");
+            assert_eq!(
+                extracted, expected,
+                "extracted {rel} differs from the .wua-staged base"
+            );
         }
     }
 
@@ -188,12 +212,51 @@ mod tests {
         use super::super::fst::{FstContent, FstNode};
         let fst = Fst {
             offset_factor: 0x20,
-            contents: vec![FstContent { offset_sectors: 0, size_sectors: 0, owner_title_id: 0, group_id: 0, flags: 0x0100 }],
+            contents: vec![FstContent {
+                offset_sectors: 0,
+                size_sectors: 0,
+                owner_title_id: 0,
+                group_id: 0,
+                flags: 0x0100,
+            }],
             nodes: vec![
-                FstNode { name: "".into(), kind: FstNodeKind::Dir { parent_index: 0, end_index: 4 }, type_flags: 0, flags: 0, cluster: 0 },
-                FstNode { name: "code".into(), kind: FstNodeKind::Dir { parent_index: 0, end_index: 3 }, type_flags: 0, flags: 0, cluster: 0 },
-                FstNode { name: "app.xml".into(), kind: FstNodeKind::File { offset: 0, size: 6 }, type_flags: 0, flags: 0, cluster: 0 },
-                FstNode { name: "meta".into(), kind: FstNodeKind::Dir { parent_index: 0, end_index: 4 }, type_flags: 0, flags: 0, cluster: 0 },
+                FstNode {
+                    name: "".into(),
+                    kind: FstNodeKind::Dir {
+                        parent_index: 0,
+                        end_index: 4,
+                    },
+                    type_flags: 0,
+                    flags: 0,
+                    cluster: 0,
+                },
+                FstNode {
+                    name: "code".into(),
+                    kind: FstNodeKind::Dir {
+                        parent_index: 0,
+                        end_index: 3,
+                    },
+                    type_flags: 0,
+                    flags: 0,
+                    cluster: 0,
+                },
+                FstNode {
+                    name: "app.xml".into(),
+                    kind: FstNodeKind::File { offset: 0, size: 6 },
+                    type_flags: 0,
+                    flags: 0,
+                    cluster: 0,
+                },
+                FstNode {
+                    name: "meta".into(),
+                    kind: FstNodeKind::Dir {
+                        parent_index: 0,
+                        end_index: 4,
+                    },
+                    type_flags: 0,
+                    flags: 0,
+                    cluster: 0,
+                },
             ],
         };
         let paths = node_paths(&fst);

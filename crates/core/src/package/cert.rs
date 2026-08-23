@@ -43,7 +43,10 @@ impl CertChain {
                 "certificate chain has unexpected signature type {sig_type:#x}"
             )));
         }
-        if !bytes.windows(ROOT_CA_ISSUER.len()).any(|w| w == ROOT_CA_ISSUER) {
+        if !bytes
+            .windows(ROOT_CA_ISSUER.len())
+            .any(|w| w == ROOT_CA_ISSUER)
+        {
             return Err(Error::UnsupportedDisc(
                 "certificate chain does not contain the Root-CA00000003 issuer".into(),
             ));

@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 
 # Local test material — real game dumps, never committed
 /test_titles/

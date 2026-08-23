@@ -40,7 +40,9 @@ mod tests {
         let xml = generate(&ids);
 
         assert!(xml.starts_with('\u{FEFF}'));
-        assert!(xml.contains("<title_id type=\"hexBinary\" length=\"8\">0005000252535045</title_id>"));
+        assert!(
+            xml.contains("<title_id type=\"hexBinary\" length=\"8\">0005000252535045</title_id>")
+        );
         assert!(xml.contains("<group_id type=\"hexBinary\" length=\"4\">52535045</group_id>"));
     }
 
@@ -48,7 +50,7 @@ mod tests {
     fn matches_reference_byte_length() {
         let ids = derive(*b"RSPE");
         let xml = generate(&ids);
-        assert_eq!(xml.as_bytes().len(), 712);
+        assert_eq!(xml.len(), 712);
     }
 
     #[test]

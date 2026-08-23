@@ -51,6 +51,9 @@ pub enum Error {
 impl Error {
     /// Wrap a [`std::io::Error`] with the path it happened on.
     pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
-        Error::Io { path: path.into(), source }
+        Error::Io {
+            path: path.into(),
+            source,
+        }
     }
 }
