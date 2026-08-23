@@ -122,6 +122,27 @@ v1 targets Wii ISO/RVZ → WUP with core options and the `main.dol` video patche
 implemented: `fw.img` controller-remap patches, video-mode/region disc patches, the
 GameCube/Nintendont path, and cheats.
 
+## Acknowledgements
+
+This is a clean-room reimplementation, but it stands on prior work. No code was copied from these
+projects; they were consulted for file-format facts and byte-level constants, credited here.
+
+* [**nod**](https://github.com/encounter/nod) (Luke Street) — the Rust disc-image library this
+  builds on: Wii partition decryption and ISO/RVZ/WBFS/… reading. Its NFS reader is our
+  round-trip and hash-validation oracle, and its Wii partition **hash-tree** implementation
+  (H0–H3 layout and verification) was the authoritative reference for our hash rebuild.
+* [**zarust**](https://crates.io/crates/zarust) — reading Cemu `.wua` ZArchive base titles.
+* [**UWUVCI (UWUVCI-AIO-WPF)**](https://github.com/stuff-by-3-random-dudes/UWUVCI-AIO-WPF) — the
+  exact `main.dol` video-patch byte patterns (deflicker / half-vfilter / dithering) are taken from
+  its `DeflickerDitheringRemover`.
+* [**TeconmoonWiiVCInjector**](https://github.com/piratesephiroth/TeconmoonWiiVCInjector) and
+  [**UWUVCI-V3**](https://github.com/AboodXD/UWUVCI-V3) — the injectors whose functionality this
+  mirrors; consulted for WUP packaging and NFS conventions.
+* [**WUP Installer GX2**](https://github.com/FIX94/wup-installer-gx2) — the on-console installer the
+  output targets.
+* [WiiBrew](https://wiibrew.org/wiki/Wii_disc) and GBAtemp threads — Wii disc / WUP / NFS format
+  documentation.
+
 ## License
 
 Licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later). See
@@ -132,4 +153,5 @@ Licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later). 
 
 This tool creates no copyrighted content and bundles no keys, certificates, or Nintendo
 binaries. You must provide your own legally-obtained game dump, base title, common key, and
-certificate chain. Reference tools were consulted only for file-format facts.
+certificate chain. Reference tools were consulted only for file-format facts (see
+[Acknowledgements](#acknowledgements)).
