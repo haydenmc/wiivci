@@ -24,8 +24,14 @@ use zarust::{ArchiveReader, EntryKind, NodeHandle, ROOT_NODE};
 use crate::error::{Error, Result};
 
 /// Files that must be present in a base title's `code/` directory.
-pub const REQUIRED_CODE_FILES: &[&str] =
-    &["cos.xml", "frisbiiU.rpx", "fw.img", "fw.tmd", "htk.bin", "nn_hai_user.rpl"];
+pub const REQUIRED_CODE_FILES: &[&str] = &[
+    "cos.xml",
+    "frisbiiU.rpx",
+    "fw.img",
+    "fw.tmd",
+    "htk.bin",
+    "nn_hai_user.rpl",
+];
 
 /// A base title staged into a build directory.
 pub struct StagedBase {
@@ -63,12 +69,20 @@ pub(crate) fn finalize_stage(build_dir: &Path) -> Result<StagedBase> {
     }
     let htk_path = code_dir.join("htk.bin");
     let htk_bytes = fs::read(&htk_path).map_err(|e| Error::io(&htk_path, e))?;
-    let htk: [u8; 16] = htk_bytes.as_slice().try_into().map_err(|_| Error::InvalidKey {
-        name: "htk.bin",
-        reason: format!("expected 16 bytes, got {}", htk_bytes.len()),
-    })?;
+    let htk: [u8; 16] = htk_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::InvalidKey {
+            name: "htk.bin",
+            reason: format!("expected 16 bytes, got {}", htk_bytes.len()),
+        })?;
 
-    Ok(StagedBase { htk, code_dir, content_dir, meta_dir })
+    Ok(StagedBase {
+        htk,
+        code_dir,
+        content_dir,
+        meta_dir,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -92,11 +106,17 @@ impl WuaBase {
         let reader = ArchiveReader::open(path).map_err(|e| wua_err(path, e))?;
 
         let mut title_root = None;
-        for entry in reader.directory_entries(ROOT_NODE).map_err(|e| wua_err(path, e))? {
+        for entry in reader
+            .directory_entries(ROOT_NODE)
+            .map_err(|e| wua_err(path, e))?
+        {
             if entry.kind == EntryKind::Directory {
                 // A title root has a `code/` child.
                 if let Ok(children) = reader.directory_entries(entry.handle) {
-                    if children.iter().any(|c| c.name == b"code" && c.is_directory()) {
+                    if children
+                        .iter()
+                        .any(|c| c.name == b"code" && c.is_directory())
+                    {
                         title_root = Some(entry.handle);
                         break;
                     }
@@ -121,7 +141,13 @@ impl WuaBase {
             .directory_entries(handle)
             .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
             .into_iter()
-            .map(|e| (String::from_utf8_lossy(e.name).into_owned(), e.kind, e.handle))
+            .map(|e| {
+                (
+                    String::from_utf8_lossy(e.name).into_owned(),
+                    e.kind,
+                    e.handle,
+                )
+            })
             .collect();
 
         for (name, kind, h) in entries {
@@ -184,7 +210,9 @@ impl DirBase {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if path.join("code").is_dir() {
-            return Ok(DirBase { root: path.to_path_buf() });
+            return Ok(DirBase {
+                root: path.to_path_buf(),
+            });
         }
         // Look one level down for a title folder.
         if let Ok(read) = fs::read_dir(path) {
@@ -236,7 +264,10 @@ pub fn open_base(path: impl AsRef<Path>) -> Result<Box<dyn BaseSource>> {
     let path = path.as_ref();
     if path.is_dir() {
         Ok(Box::new(DirBase::new(path)?))
-    } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("wua")) {
+    } else if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("wua"))
+    {
         Ok(Box::new(WuaBase::open(path)?))
     } else {
         Err(Error::UnsupportedDisc(format!(

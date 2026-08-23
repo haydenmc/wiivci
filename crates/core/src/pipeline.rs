@@ -17,17 +17,18 @@ use crate::base::BaseSource;
 use crate::error::{Error, Result};
 use crate::input::SourceDisc;
 use crate::keys::WiiUCommonKey;
+use crate::meta::appxml;
 use crate::meta::metaxml::{patch as patch_meta, MetaOptions};
 use crate::meta::titleid;
-use crate::meta::appxml;
 use crate::nfs::build_nfs;
 use crate::package::cert::CertChain;
 use crate::package::{build_package, PackageParams, PackageStats};
 
 /// Fixed plaintext title key used to encrypt content (stored, encrypted, in the ticket — its
 /// value is arbitrary, matching the convention of the reference tools).
-const TITLE_KEY: [u8; 16] =
-    [0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37];
+const TITLE_KEY: [u8; 16] = [
+    0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37,
+];
 
 /// Region code written to `meta.xml` (bitmask: 1=JP, 2=US, 4=EU).
 #[derive(Clone, Copy, Debug)]
@@ -109,7 +110,11 @@ pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
     // 2. Convert the disc to NFS under content/.
     log::info!("building NFS (this reads the whole disc)…");
     let nfs_stats = build_nfs(&mut source, &staged.htk, &staged.content_dir)?;
-    log::info!("NFS: {} file(s), {} bytes", nfs_stats.file_count, nfs_stats.total_bytes);
+    log::info!(
+        "NFS: {} file(s), {} bytes",
+        nfs_stats.file_count,
+        nfs_stats.total_bytes
+    );
 
     // 3. Game ticket/TMD become rvlt.tik / rvlt.tmd.
     std::fs::write(staged.code_dir.join("rvlt.tik"), source.raw_ticket())
@@ -154,7 +159,13 @@ pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
     };
     let package = build_package(work_dir, &config.out, &params)?;
 
-    Ok(Summary { title_id: ids.title_id, game_id, title, package, out: config.out.clone() })
+    Ok(Summary {
+        title_id: ids.title_id,
+        game_id,
+        title,
+        package,
+        out: config.out.clone(),
+    })
 }
 
 fn resolve_title(config: &Config, game_id: &str) -> String {

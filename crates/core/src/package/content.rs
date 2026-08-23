@@ -57,8 +57,19 @@ pub struct PackagePlan {
 
 // Intermediate tree node before FST serialization.
 enum Tree {
-    Dir { name: String, flags: u16, children: Vec<Tree> },
-    File { name: String, path: PathBuf, size: u64, cluster: u16, flags: u16, type_flags: u8 },
+    Dir {
+        name: String,
+        flags: u16,
+        children: Vec<Tree>,
+    },
+    File {
+        name: String,
+        path: PathBuf,
+        size: u64,
+        cluster: u16,
+        flags: u16,
+        type_flags: u8,
+    },
 }
 
 fn align_up(n: u64, to: u64) -> u64 {
@@ -70,8 +81,10 @@ fn is_hif(name: &str) -> bool {
 }
 
 fn read_dir_sorted(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
-    let mut entries: Vec<_> =
-        std::fs::read_dir(dir).map_err(|e| Error::io(dir, e))?.collect::<std::result::Result<_, _>>().map_err(|e| Error::io(dir, e))?;
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| Error::io(dir, e))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::io(dir, e))?;
     // Case-insensitive by name, matching retail FST ordering.
     entries.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
     Ok(entries)
@@ -89,7 +102,12 @@ pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
 
     let new_content = |ct: u16, contents: &mut Vec<PlannedContent>| -> u16 {
         let idx = contents.len() as u16;
-        contents.push(PlannedContent { index: idx, content_type: ct, files: Vec::new(), data_len: 0 });
+        contents.push(PlannedContent {
+            index: idx,
+            content_type: ct,
+            files: Vec::new(),
+            data_len: 0,
+        });
         idx
     };
 
@@ -111,7 +129,14 @@ pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
             } else {
                 code_content
             };
-            code_children.push(Tree::File { name, path, size, cluster, flags: 0x0000, type_flags: 0 });
+            code_children.push(Tree::File {
+                name,
+                path,
+                size,
+                cluster,
+                flags: 0x0000,
+                type_flags: 0,
+            });
         }
     }
 
@@ -135,7 +160,14 @@ pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
                 continue;
             }
             let size = entry.metadata().map_err(|e| Error::io(&path, e))?.len();
-            meta_children.push(Tree::File { name, path, size, cluster: meta_content, flags: 0x0040, type_flags: 0 });
+            meta_children.push(Tree::File {
+                name,
+                path,
+                size,
+                cluster: meta_content,
+                flags: 0x0040,
+                type_flags: 0,
+            });
         }
     }
 
@@ -143,14 +175,26 @@ pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
     let mut root_children = Vec::new();
     if !code_children.is_empty() {
         let cluster = first_cluster(&code_children);
-        root_children.push(Tree::Dir { name: "code".into(), flags: 0x0000, children: code_children });
+        root_children.push(Tree::Dir {
+            name: "code".into(),
+            flags: 0x0000,
+            children: code_children,
+        });
         let _ = cluster;
     }
     if !content_children.is_empty() {
-        root_children.push(Tree::Dir { name: "content".into(), flags: 0x0400, children: content_children });
+        root_children.push(Tree::Dir {
+            name: "content".into(),
+            flags: 0x0400,
+            children: content_children,
+        });
     }
     if !meta_children.is_empty() {
-        root_children.push(Tree::Dir { name: "meta".into(), flags: 0x0040, children: meta_children });
+        root_children.push(Tree::Dir {
+            name: "meta".into(),
+            flags: 0x0040,
+            children: meta_children,
+        });
     }
 
     // Flatten to FST nodes, assigning per-content offsets in traversal order.
@@ -158,7 +202,10 @@ pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
     // Root node placeholder; end_index filled after flattening.
     nodes.push(FstNode {
         name: String::new(),
-        kind: FstNodeKind::Dir { parent_index: 0, end_index: 0 },
+        kind: FstNodeKind::Dir {
+            parent_index: 0,
+            end_index: 0,
+        },
         type_flags: 0,
         flags: 0,
         cluster: 0,
@@ -188,12 +235,19 @@ pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
         cursor_sectors += size_sectors as u32;
     }
 
-    let fst = Fst { offset_factor: OFFSET_FACTOR, contents: fst_contents, nodes };
+    let fst = Fst {
+        offset_factor: OFFSET_FACTOR,
+        contents: fst_contents,
+        nodes,
+    };
     let fst_bytes = fst.serialize();
     // Record the FST content's own data length.
     contents[0].data_len = fst_bytes.len() as u64;
 
-    Ok(PackagePlan { fst: fst_bytes, contents })
+    Ok(PackagePlan {
+        fst: fst_bytes,
+        contents,
+    })
 }
 
 fn first_cluster(children: &[Tree]) -> u16 {
@@ -221,17 +275,33 @@ fn build_content_tree(
         let path = entry.path();
         if path.is_dir() {
             let children = build_content_tree(&path, assets_content, contents)?;
-            out.push(Tree::Dir { name, flags: 0x0400, children });
+            out.push(Tree::Dir {
+                name,
+                flags: 0x0400,
+                children,
+            });
         } else {
             let size = entry.metadata().map_err(|e| Error::io(&path, e))?.len();
             let (cluster, type_flags) = if is_hif(&name) {
                 let idx = contents.len() as u16;
-                contents.push(PlannedContent { index: idx, content_type: TYPE_HASHED, files: Vec::new(), data_len: 0 });
+                contents.push(PlannedContent {
+                    index: idx,
+                    content_type: TYPE_HASHED,
+                    files: Vec::new(),
+                    data_len: 0,
+                });
                 (idx, 0x02)
             } else {
                 (assets_content, 0x00)
             };
-            out.push(Tree::File { name, path, size, cluster, flags: 0x0400, type_flags });
+            out.push(Tree::File {
+                name,
+                path,
+                size,
+                cluster,
+                flags: 0x0400,
+                type_flags,
+            });
         }
     }
     Ok(out)
@@ -245,11 +315,18 @@ fn flatten(
 ) {
     for child in children {
         match child {
-            Tree::Dir { name, flags, children } => {
+            Tree::Dir {
+                name,
+                flags,
+                children,
+            } => {
                 let my_index = nodes.len() as u32;
                 nodes.push(FstNode {
                     name: name.clone(),
-                    kind: FstNodeKind::Dir { parent_index, end_index: 0 },
+                    kind: FstNodeKind::Dir {
+                        parent_index,
+                        end_index: 0,
+                    },
                     type_flags: 0,
                     flags: *flags,
                     cluster: 0,
@@ -260,17 +337,34 @@ fn flatten(
                     *end_index = end;
                 }
                 // A directory's cluster mirrors its first child's (cosmetic).
-                let cluster = nodes.get(my_index as usize + 1).map(|n| n.cluster).unwrap_or(0);
+                let cluster = nodes
+                    .get(my_index as usize + 1)
+                    .map(|n| n.cluster)
+                    .unwrap_or(0);
                 nodes[my_index as usize].cluster = cluster;
             }
-            Tree::File { name, path, size, cluster, flags, type_flags } => {
+            Tree::File {
+                name,
+                path,
+                size,
+                cluster,
+                flags,
+                type_flags,
+            } => {
                 let c = &mut contents[*cluster as usize];
                 let offset = align_up(c.data_len, OFFSET_FACTOR as u64);
-                c.files.push(PlacedFile { path: path.clone(), offset, size: *size });
+                c.files.push(PlacedFile {
+                    path: path.clone(),
+                    offset,
+                    size: *size,
+                });
                 c.data_len = offset + *size;
                 nodes.push(FstNode {
                     name: name.clone(),
-                    kind: FstNodeKind::File { offset, size: *size },
+                    kind: FstNodeKind::File {
+                        offset,
+                        size: *size,
+                    },
                     type_flags: *type_flags,
                     flags: *flags,
                     cluster: *cluster,
@@ -294,7 +388,11 @@ mod tests {
         std::fs::write(root.join("code/app.xml"), b"<app/>").unwrap();
         std::fs::write(root.join("code/cos.xml"), b"<cos/>").unwrap();
         std::fs::write(root.join("code/frisbiiU.rpx"), vec![0u8; 100]).unwrap();
-        std::fs::write(root.join("content/assets/shaders/cafe/banner.gsh"), vec![1u8; 50]).unwrap();
+        std::fs::write(
+            root.join("content/assets/shaders/cafe/banner.gsh"),
+            vec![1u8; 50],
+        )
+        .unwrap();
         std::fs::write(root.join("content/hif_000000.nfs"), vec![2u8; 0x8000]).unwrap();
         std::fs::write(root.join("meta/meta.xml"), b"<menu/>").unwrap();
         std::fs::write(root.join("meta/iconTex.tga"), vec![3u8; 200]).unwrap();
@@ -310,12 +408,20 @@ mod tests {
         assert!(names.contains(&"frisbiiU.rpx"));
         assert!(names.contains(&"hif_000000.nfs"));
         // The hif file carries the 0x02 entry type flag.
-        let hif = parsed.nodes.iter().find(|n| n.name == "hif_000000.nfs").unwrap();
+        let hif = parsed
+            .nodes
+            .iter()
+            .find(|n| n.name == "hif_000000.nfs")
+            .unwrap();
         assert_eq!(hif.type_flags, 0x02);
         // app.xml and cos.xml share the code content; frisbiiU.rpx is separate.
         let app = parsed.nodes.iter().find(|n| n.name == "app.xml").unwrap();
         let cos = parsed.nodes.iter().find(|n| n.name == "cos.xml").unwrap();
-        let rpx = parsed.nodes.iter().find(|n| n.name == "frisbiiU.rpx").unwrap();
+        let rpx = parsed
+            .nodes
+            .iter()
+            .find(|n| n.name == "frisbiiU.rpx")
+            .unwrap();
         assert_eq!(app.cluster, cos.cluster);
         assert_ne!(app.cluster, rpx.cluster);
     }

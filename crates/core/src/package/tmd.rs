@@ -137,17 +137,32 @@ mod tests {
     #[test]
     fn tmd_structure_is_self_consistent() {
         let contents = vec![
-            ContentRecord { id: 0, index: 0, content_type: 0x2001, size: 0x8000, hash: [1; 20] },
-            ContentRecord { id: 1, index: 1, content_type: 0x2003, size: 0x10000, hash: [2; 20] },
+            ContentRecord {
+                id: 0,
+                index: 0,
+                content_type: 0x2001,
+                size: 0x8000,
+                hash: [1; 20],
+            },
+            ContentRecord {
+                id: 1,
+                index: 1,
+                content_type: 0x2003,
+                size: 0x10000,
+                hash: [2; 20],
+            },
         ];
         let tmd = build_tmd(0x0005000252535045, 0x5045, &contents);
         assert_eq!(&tmd[0x140..0x140 + 26], b"Root-CA00000003-CP0000000b");
         assert_eq!(&tmd[0x18C..0x194], &0x0005000252535045u64.to_be_bytes());
         let mut c = Cursor::new(&tmd[0x1DE..0x1E0]);
         assert_eq!(c.read_u16::<BigEndian>().unwrap(), 2); // content count
-        // info table hash chain
+                                                           // info table hash chain
         let info_hash = &tmd[0x1E4..0x204];
-        assert_eq!(info_hash, Sha256::digest(&tmd[0x204..0x204 + INFO_TABLE_LEN]).as_slice());
+        assert_eq!(
+            info_hash,
+            Sha256::digest(&tmd[0x204..0x204 + INFO_TABLE_LEN]).as_slice()
+        );
         let records = &tmd[RECORDS_OFF..];
         assert_eq!(&tmd[0x208..0x228], Sha256::digest(records).as_slice());
     }
@@ -182,6 +197,10 @@ mod tests {
         let group_id = u16::from_be_bytes([reference[0x198], reference[0x199]]);
         let ours = build_tmd(title_id, group_id, &contents);
         let end = RECORDS_OFF + count * 0x30;
-        assert_eq!(&ours[0x140..], &reference[0x140..end], "TMD body differs from reference");
+        assert_eq!(
+            &ours[0x140..],
+            &reference[0x140..end],
+            "TMD body differs from reference"
+        );
     }
 }

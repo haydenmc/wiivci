@@ -8,7 +8,7 @@
 //! This mirrors `nod`'s NFS *reader* (which decrypts with the identical key/IV scheme), so
 //! output produced here round-trips back through `nod` to the original decrypted disc.
 
-use aes::cipher::{block_padding::NoPadding, BlockEncryptMut, BlockDecryptMut, KeyIvInit};
+use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes::Aes128;
 
 /// Compute the CBC IV for a given logical sector.

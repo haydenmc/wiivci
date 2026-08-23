@@ -49,7 +49,10 @@ impl SourceDisc {
     /// Open a Wii disc image in decrypted mode.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let options = OpenOptions { rebuild_encryption: false, ..Default::default() };
+        let options = OpenOptions {
+            rebuild_encryption: false,
+            ..Default::default()
+        };
         let disc = Disc::new_with_options(&path, &options)?;
 
         let header = disc.header();
@@ -107,40 +110,65 @@ impl SourceDisc {
     }
 
     /// The 6-character game ID (e.g. `RSPE01`).
-    pub fn game_id(&self) -> [u8; 6] { self.game_id }
+    pub fn game_id(&self) -> [u8; 6] {
+        self.game_id
+    }
 
     /// The 6-character game ID as a string.
-    pub fn game_id_str(&self) -> String { String::from_utf8_lossy(&self.game_id).into_owned() }
+    pub fn game_id_str(&self) -> String {
+        String::from_utf8_lossy(&self.game_id).into_owned()
+    }
 
     /// The 4-character disc ID used to derive the Wii U title ID (first 4 game-id bytes).
     pub fn disc_id4(&self) -> [u8; 4] {
-        [self.game_id[0], self.game_id[1], self.game_id[2], self.game_id[3]]
+        [
+            self.game_id[0],
+            self.game_id[1],
+            self.game_id[2],
+            self.game_id[3],
+        ]
     }
 
     /// The logical disc size in bytes.
-    pub fn disc_size(&self) -> u64 { self.disc_size }
+    pub fn disc_size(&self) -> u64 {
+        self.disc_size
+    }
 
     /// The data partition's sector span.
-    pub fn data_partition(&self) -> PartitionSpan { self.data_partition }
+    pub fn data_partition(&self) -> PartitionSpan {
+        self.data_partition
+    }
 
     /// Every partition's sector span, sorted ascending by start sector.
-    pub fn partitions(&self) -> &[PartitionSpan] { &self.partitions }
+    pub fn partitions(&self) -> &[PartitionSpan] {
+        &self.partitions
+    }
 
     /// The game partition ticket bytes (`code/rvlt.tik`).
-    pub fn raw_ticket(&self) -> &[u8] { &self.raw_ticket }
+    pub fn raw_ticket(&self) -> &[u8] {
+        &self.raw_ticket
+    }
 
     /// The game partition TMD bytes (`code/rvlt.tmd`).
-    pub fn raw_tmd(&self) -> &[u8] { &self.raw_tmd }
+    pub fn raw_tmd(&self) -> &[u8] {
+        &self.raw_tmd
+    }
 
     /// The game partition certificate chain, if present.
-    pub fn raw_cert_chain(&self) -> Option<&[u8]> { self.raw_cert_chain.as_deref() }
+    pub fn raw_cert_chain(&self) -> Option<&[u8]> {
+        self.raw_cert_chain.as_deref()
+    }
 
     /// The path the disc was opened from.
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
     /// Mutable access to the underlying decrypted disc stream (`Read + Seek`).
     ///
     /// Reading yields the full logical disc image with partition data decrypted and hash
     /// blocks intact; sectors outside partitions are raw disc bytes.
-    pub fn stream(&mut self) -> &mut Disc { &mut self.disc }
+    pub fn stream(&mut self) -> &mut Disc {
+        &mut self.disc
+    }
 }

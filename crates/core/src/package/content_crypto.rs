@@ -85,7 +85,12 @@ pub fn encode_nonhashed(key: &Key, index: u16, plaintext: &[u8]) -> EncodedConte
     let tmd_hash = sha1(&buf);
     cbc_encrypt(key, content_iv(index), &mut buf);
     let size = buf.len() as u64;
-    EncodedContent { data: buf, h3: None, tmd_hash, size }
+    EncodedContent {
+        data: buf,
+        h3: None,
+        tmd_hash,
+        size,
+    }
 }
 
 /// Gather the 0x140-byte hash section for the 16 children starting at `base`, zero-filling
@@ -154,7 +159,12 @@ pub fn encode_hashed(key: &Key, index: u16, plaintext: &[u8]) -> EncodedContent 
 
     let tmd_hash = sha1(&h3);
     let size = data.len() as u64;
-    EncodedContent { data, h3: Some(h3), tmd_hash, size }
+    EncodedContent {
+        data,
+        h3: Some(h3),
+        tmd_hash,
+        size,
+    }
 }
 
 /// Decrypt a non-hashed content, returning the padded plaintext (inverse of
@@ -214,7 +224,9 @@ mod tests {
     #[test]
     fn encode_decode_round_trips() {
         let key = [0x5Au8; 16];
-        let plain: Vec<u8> = (0..HASH_BLOCK_DATA * 2 + 500).map(|i| (i * 3) as u8).collect();
+        let plain: Vec<u8> = (0..HASH_BLOCK_DATA * 2 + 500)
+            .map(|i| (i * 3) as u8)
+            .collect();
         // Hashed: decode returns block-padded data, so compare only the original prefix.
         let enc = encode_hashed(&key, 7, &plain);
         let dec = decode_hashed(&key, 7, &enc.data);
@@ -233,8 +245,8 @@ mod tests {
         let hex = std::env::var("WIIU_COMMON_KEY").ok()?;
         let common: Key = {
             let mut k = [0u8; 16];
-            for i in 0..16 {
-                k[i] = u8::from_str_radix(hex.trim().get(i * 2..i * 2 + 2)?, 16).ok()?;
+            for (i, byte) in k.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(hex.trim().get(i * 2..i * 2 + 2)?, 16).ok()?;
             }
             k
         };

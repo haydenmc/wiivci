@@ -44,7 +44,11 @@ fn parse_key(name: &'static str, raw: &[u8]) -> Result<Key> {
         key.copy_from_slice(raw);
         return Ok(key);
     }
-    let trimmed: Vec<u8> = raw.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+    let trimmed: Vec<u8> = raw
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
     if trimmed.len() == 32 && trimmed.iter().all(|b| b.is_ascii_hexdigit()) {
         let s = std::str::from_utf8(&trimmed).expect("hex digits are utf-8");
         let mut key = [0u8; 16];
@@ -55,7 +59,10 @@ fn parse_key(name: &'static str, raw: &[u8]) -> Result<Key> {
     }
     Err(Error::InvalidKey {
         name,
-        reason: format!("expected 16 raw bytes or 32 hex chars, got {} bytes", raw.len()),
+        reason: format!(
+            "expected 16 raw bytes or 32 hex chars, got {} bytes",
+            raw.len()
+        ),
     })
 }
 
@@ -69,7 +76,10 @@ fn validate(name: &'static str, key: &Key, expected_md5: &[u8; 16]) -> Result<()
     if &md5(key) == expected_md5 {
         Ok(())
     } else {
-        Err(Error::InvalidKey { name, reason: "MD5 fingerprint does not match the retail key".into() })
+        Err(Error::InvalidKey {
+            name,
+            reason: "MD5 fingerprint does not match the retail key".into(),
+        })
     }
 }
 

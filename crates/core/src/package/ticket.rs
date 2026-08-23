@@ -78,7 +78,11 @@ pub fn encrypt_title_key(common_key: &[u8; 16], title_id: u64, title_key: &[u8; 
 
 /// Decrypt an encrypted title key (as stored in a ticket or a title-key database) with the
 /// Wii U common key. IV = `title_id ++ 0*8`. Inverse of [`encrypt_title_key`].
-pub fn decrypt_title_key(common_key: &[u8; 16], title_id: u64, enc_title_key: &[u8; 16]) -> [u8; 16] {
+pub fn decrypt_title_key(
+    common_key: &[u8; 16],
+    title_id: u64,
+    enc_title_key: &[u8; 16],
+) -> [u8; 16] {
     let mut iv = [0u8; 16];
     iv[..8].copy_from_slice(&title_id.to_be_bytes());
     let mut buf = *enc_title_key;
@@ -132,6 +136,10 @@ mod tests {
         let mut key = [0u8; 16];
         key.copy_from_slice(&reference[0x1BF..0x1CF]);
         let ours = build_ticket(title_id, &key);
-        assert_eq!(&ours[0x140..], &reference[0x140..], "ticket body differs from reference");
+        assert_eq!(
+            &ours[0x140..],
+            &reference[0x140..],
+            "ticket body differs from reference"
+        );
     }
 }
