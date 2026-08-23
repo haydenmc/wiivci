@@ -43,6 +43,19 @@ Useful options: `--icon/--boot-tv/--boot-drc <png>` to supply artwork, `--region
 `--no-gamepad`, `--offline` (skip GameTDB/art lookups), `--work-dir <dir>` (keep the
 intermediate build tree).
 
+### Video patches
+
+Optional patches to the game's `main.dol` (the same ones UWUVCI offers), for a sharper picture:
+
+* `--deflicker` — remove the vertical flicker filter entirely.
+* `--half-vfilter` — halve the vertical filter instead of removing it (softer).
+* `--remove-dithering` — remove framebuffer dithering (better colour accuracy).
+
+These edit the game executable inside the disc, so the tool relocates `main.dol`, applies the
+patch, and rebuilds the Wii partition hash tree over the affected clusters (updating the H3
+table and re-fakesigning `rvlt.tmd`). A requested patch whose signature isn't present in a given
+game is skipped with a warning.
+
 ### Downloading the base from NUS
 
 Instead of `--base`, you can have the tool fetch the base title straight from Nintendo's CCS
@@ -68,7 +81,9 @@ pins a TMD version and `--nus-url <url>` points at a mirror.
 2. **Stage** the base title's `code/`/`content/`/`meta/` into a build directory (`.wua` read
    natively via the pure-Rust [`zarust`](https://crates.io/crates/zarust)).
 3. **NFS**: pack the decrypted disc into `hif_%06d.nfs` (EGGS header + sparse LBA table +
-   per-sector AES-128-CBC with the base's `htk.bin`, split at 250 MiB).
+   per-sector AES-128-CBC with the base's `htk.bin`, split at 250 MiB). The Wii partition hash
+   tree (H0–H3) is rebuilt while packing — required because RVZ/WIA sources store the data with
+   the per-cluster hash blocks zeroed — and any `main.dol` video patches are applied here.
 4. Drop in the game's `rvlt.tik`/`rvlt.tmd` and fakesign-patch `fw.img`.
 5. **Metadata**: regenerate `code/app.xml` and patch `meta/meta.xml` (title id, names,
    region); render `meta/*.tga` boot textures from PNG art.
@@ -103,9 +118,30 @@ Cross-validation tests are `#[ignore]`d and require local reference files plus
 
 ## Scope
 
-v1 targets Wii ISO/RVZ → WUP with core options. Not yet implemented: `fw.img`
-controller-remap patches, video-mode/region disc patches, the GameCube/Nintendont path,
-cheats, and downloading the base from NUS (the `BaseSource` trait leaves room for it).
+v1 targets Wii ISO/RVZ → WUP with core options and the `main.dol` video patches above. Not yet
+implemented: `fw.img` controller-remap patches, video-mode/region disc patches, the
+GameCube/Nintendont path, and cheats.
+
+## Acknowledgements
+
+This is a clean-room reimplementation, but it stands on prior work. No code was copied from these
+projects; they were consulted for file-format facts and byte-level constants, credited here.
+
+* [**nod**](https://github.com/encounter/nod) (Luke Street) — the Rust disc-image library this
+  builds on: Wii partition decryption and ISO/RVZ/WBFS/… reading. Its NFS reader is our
+  round-trip and hash-validation oracle, and its Wii partition **hash-tree** implementation
+  (H0–H3 layout and verification) was the authoritative reference for our hash rebuild.
+* [**zarust**](https://crates.io/crates/zarust) — reading Cemu `.wua` ZArchive base titles.
+* [**UWUVCI (UWUVCI-AIO-WPF)**](https://github.com/stuff-by-3-random-dudes/UWUVCI-AIO-WPF) — the
+  exact `main.dol` video-patch byte patterns (deflicker / half-vfilter / dithering) are taken from
+  its `DeflickerDitheringRemover`.
+* [**TeconmoonWiiVCInjector**](https://github.com/piratesephiroth/TeconmoonWiiVCInjector) and
+  [**UWUVCI-V3**](https://github.com/AboodXD/UWUVCI-V3) — the injectors whose functionality this
+  mirrors; consulted for WUP packaging and NFS conventions.
+* [**WUP Installer GX2**](https://github.com/FIX94/wup-installer-gx2) — the on-console installer the
+  output targets.
+* [WiiBrew](https://wiibrew.org/wiki/Wii_disc) and GBAtemp threads — Wii disc / WUP / NFS format
+  documentation.
 
 ## License
 
@@ -117,4 +153,5 @@ Licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later). 
 
 This tool creates no copyrighted content and bundles no keys, certificates, or Nintendo
 binaries. You must provide your own legally-obtained game dump, base title, common key, and
-certificate chain. Reference tools were consulted only for file-format facts.
+certificate chain. Reference tools were consulted only for file-format facts (see
+[Acknowledgements](#acknowledgements)).

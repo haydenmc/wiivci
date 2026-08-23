@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::assets::images::{png_to_tga, BootTexture};
 use crate::assets::{artrepo, gametdb};
 use crate::base::BaseSource;
+use crate::disc_patch;
 use crate::error::{Error, Result};
 use crate::input::SourceDisc;
 use crate::keys::WiiUCommonKey;
@@ -23,6 +24,7 @@ use crate::meta::titleid;
 use crate::nfs::build_nfs;
 use crate::package::cert::CertChain;
 use crate::package::{build_package, PackageParams, PackageStats};
+use crate::video::VideoPatches;
 
 /// Fixed plaintext title key used to encrypt content (stored, encrypted, in the ticket — its
 /// value is arbitrary, matching the convention of the reference tools).
@@ -77,6 +79,8 @@ pub struct Config {
     pub gamepad: bool,
     /// Fetch missing art/title from online services.
     pub online: bool,
+    /// Optional `main.dol` video patches (flicker filter / dithering).
+    pub video: VideoPatches,
 }
 
 /// Result of an injection.
@@ -107,25 +111,34 @@ pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
     log::info!("staging base title");
     let staged = config.base.stage(work_dir)?;
 
-    // 2. Convert the disc to NFS under content/.
+    // 2. Plan the whole-disc hash rebuild (RVZ/WIA zero the per-cluster hashes) plus any
+    //    main.dol video patches (see crate::disc_patch).
+    let plan = disc_patch::plan_disc(&mut source, &config.video)?;
+
+    // 3. Convert the disc to NFS under content/, rebuilding the Wii hash tree.
     log::info!("building NFS (this reads the whole disc)…");
-    let nfs_stats = build_nfs(&mut source, &staged.htk, &staged.content_dir)?;
+    let nfs_stats = build_nfs(&mut source, &staged.htk, &staged.content_dir, &plan)?;
     log::info!(
         "NFS: {} file(s), {} bytes",
         nfs_stats.file_count,
         nfs_stats.total_bytes
     );
 
-    // 3. Game ticket/TMD become rvlt.tik / rvlt.tmd.
+    // 4. Game ticket/TMD become rvlt.tik / rvlt.tmd. When the disc was patched, rvlt.tmd's
+    //    content hash must be updated to the rebuilt H3 table and re-fakesigned.
     std::fs::write(staged.code_dir.join("rvlt.tik"), source.raw_ticket())
         .map_err(|e| Error::io(staged.code_dir.join("rvlt.tik"), e))?;
-    std::fs::write(staged.code_dir.join("rvlt.tmd"), source.raw_tmd())
+    let mut rvlt_tmd = source.raw_tmd().to_vec();
+    if let Some(content_hash) = plan.rvlt_content_hash {
+        update_rvlt_tmd(&mut rvlt_tmd, &content_hash);
+    }
+    std::fs::write(staged.code_dir.join("rvlt.tmd"), &rvlt_tmd)
         .map_err(|e| Error::io(staged.code_dir.join("rvlt.tmd"), e))?;
 
-    // 4. Fakesign-patch fw.img so the (fakesigned) title is accepted.
+    // 5. Fakesign-patch fw.img so the (fakesigned) title is accepted.
     patch_fwimg_fakesign(&staged.code_dir.join("fw.img"))?;
 
-    // 5. Metadata: app.xml + meta.xml.
+    // 6. Metadata: app.xml + meta.xml.
     std::fs::write(staged.code_dir.join("app.xml"), appxml::generate(&ids))
         .map_err(|e| Error::io(staged.code_dir.join("app.xml"), e))?;
 
@@ -145,10 +158,10 @@ pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
     )?;
     std::fs::write(&meta_path, patched).map_err(|e| Error::io(&meta_path, e))?;
 
-    // 6. Boot textures (icon / TV / DRC).
+    // 7. Boot textures (icon / TV / DRC).
     resolve_textures(&config, &game_id, &staged.meta_dir)?;
 
-    // 7. Package.
+    // 8. Package.
     log::info!("packaging WUP into {}", config.out.display());
     let params = PackageParams {
         title_id: ids.title_id,
@@ -203,6 +216,19 @@ fn resolve_textures(config: &Config, game_id: &str, meta_dir: &Path) -> Result<(
         }
     }
     Ok(())
+}
+
+/// After a `main.dol` patch, point the Wii partition TMD's single content record at the rebuilt
+/// H3 table and fakesign it. The Wii TMD stores the content hash at `0x1F4` and its RSA-2048
+/// signature at `0x004..0x104`; zeroing the signature is accepted on signature-patched consoles
+/// (the same basis this tool already relies on for `title.tmd`/`title.tik`).
+fn update_rvlt_tmd(tmd: &mut [u8], content_hash: &[u8; 20]) {
+    const SIG: std::ops::Range<usize> = 0x004..0x104;
+    const CONTENT0_HASH: usize = 0x1F4;
+    if tmd.len() >= CONTENT0_HASH + 20 {
+        tmd[SIG].fill(0);
+        tmd[CONTENT0_HASH..CONTENT0_HASH + 20].copy_from_slice(content_hash);
+    }
 }
 
 /// Neuter `fw.img`'s signature check by zeroing the byte after the `20 07 23 A2` pattern, so

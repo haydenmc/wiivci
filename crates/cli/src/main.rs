@@ -14,6 +14,7 @@ use wiivci_core::keys::WiiUCommonKey;
 use wiivci_core::nus::{NusBase, NusClient};
 use wiivci_core::package::cert::CertChain;
 use wiivci_core::pipeline::{self, Config, Region};
+use wiivci_core::video::VideoPatches;
 
 /// Inject a Wii game (ISO/RVZ) into an installable Wii U Virtual Console package.
 #[derive(Parser, Debug)]
@@ -84,6 +85,18 @@ struct Cli {
     /// Disable all network lookups (GameTDB title + cover art).
     #[arg(long)]
     offline: bool,
+
+    /// Remove the video flicker filter (patches the game's main.dol for a sharper image).
+    #[arg(long)]
+    deflicker: bool,
+
+    /// Halve the vertical filter instead of removing it (softer than --deflicker).
+    #[arg(long)]
+    half_vfilter: bool,
+
+    /// Remove framebuffer dithering (better colour accuracy).
+    #[arg(long)]
+    remove_dithering: bool,
 
     /// Keep the intermediate build directory instead of deleting it.
     #[arg(long, value_name = "DIR")]
@@ -182,6 +195,11 @@ fn run() -> Result<()> {
         region: cli.region.into(),
         gamepad: !cli.no_gamepad,
         online: !cli.offline,
+        video: VideoPatches {
+            deflicker: cli.deflicker,
+            half_vfilter: cli.half_vfilter,
+            dithering: cli.remove_dithering,
+        },
     };
 
     // Use a caller-provided work dir, or a temp dir cleaned up on completion.

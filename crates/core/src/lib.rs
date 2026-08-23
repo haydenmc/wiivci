@@ -9,6 +9,7 @@
 
 pub mod assets;
 pub mod base;
+pub mod disc_patch;
 pub mod error;
 pub mod input;
 pub mod keys;
@@ -17,5 +18,6 @@ pub mod nfs;
 pub mod nus;
 pub mod package;
 pub mod pipeline;
+pub mod video;
 
 pub use error::{Error, Result};
