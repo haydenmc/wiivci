@@ -165,7 +165,7 @@ pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
         .map_err(|e| Error::io(staged.code_dir.join("rvlt.tmd"), e))?;
 
     // 5. Fakesign-patch fw.img so the (fakesigned) title is accepted.
-    patch_fwimg_fakesign(&staged.code_dir.join("fw.img"))?;
+    fwimg::patch_file(&staged.code_dir.join("fw.img"), fwimg::FAKESIGN_PATCHES)?;
 
     // 6. Metadata: app.xml + meta.xml.
     std::fs::write(staged.code_dir.join("app.xml"), appxml::generate(&ids))
@@ -383,29 +383,4 @@ fn update_rvlt_tmd(tmd: &mut [u8], content_hash: &[u8; 20]) {
         tmd[SIG].fill(0);
         tmd[CONTENT0_HASH..CONTENT0_HASH + 20].copy_from_slice(content_hash);
     }
-}
-
-/// Neuter `fw.img`'s signature check by zeroing the byte after the `20 07 23 A2` pattern, so
-/// the fakesigned title is accepted (the console still needs signature patches at runtime).
-fn patch_fwimg_fakesign(path: &Path) -> Result<()> {
-    let mut data = std::fs::read(path).map_err(|e| Error::io(path, e))?;
-    const PATTERN: [u8; 4] = [0x20, 0x07, 0x23, 0xA2];
-    let mut patched = 0;
-    let mut i = 0;
-    while i + PATTERN.len() <= data.len() {
-        if data[i..i + 4] == PATTERN {
-            data[i + 1] = 0x00;
-            patched += 1;
-            i += 4;
-        } else {
-            i += 1;
-        }
-    }
-    if patched > 0 {
-        std::fs::write(path, &data).map_err(|e| Error::io(path, e))?;
-        log::info!("patched fw.img fakesigning ({patched} site(s))");
-    } else {
-        log::warn!("fw.img fakesign pattern not found; title may not load without it");
-    }
-    Ok(())
 }

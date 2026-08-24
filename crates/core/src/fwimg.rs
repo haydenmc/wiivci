@@ -63,6 +63,11 @@ pub const MEMPROT: BytePatch = BytePatch {
     all: false,
 };
 
+/// The patch set for an ordinary (Wii) fakesigned title: both fakesign signature variants.
+/// Bases differ in which one they use — Rhythm Heaven Fever, for instance, uses the `20 07 4B 0B`
+/// variant — so we try both; a missing one is a no-op.
+pub const FAKESIGN_PATCHES: &[BytePatch] = &[FAKESIGN_A, FAKESIGN_B];
+
 /// The patch set for a homebrew-booting (Nintendont) title: fakesign + AHBPROT + MEMPROT.
 pub const HOMEBREW_PATCHES: &[BytePatch] = &[FAKESIGN_A, FAKESIGN_B, AHBPROT, MEMPROT];
 
@@ -154,6 +159,26 @@ mod tests {
         let applied = apply_patches(&mut data, &[AHBPROT], false);
         assert!(applied.is_empty());
         assert_eq!(data, vec![0u8; 16], "no bytes changed when pattern absent");
+    }
+
+    /// Against a real staged base `fw.img`, the Wii fakesign set must find a site (Rhythm Heaven
+    /// Fever uses the `20 07 4B 0B` variant at 0x271EE). Guards the regression where only the
+    /// `20 07 23 A2` variant was checked and the warning fired on a patchable base.
+    #[test]
+    #[ignore = "needs .dev/base/code/fw.img"]
+    fn patches_real_base_fwimg() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev/base/code/fw.img");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let mut data = std::fs::read(&path).unwrap();
+        let applied = apply_patches(&mut data, FAKESIGN_PATCHES, true);
+        assert!(
+            !applied.is_empty(),
+            "a real base fw.img must match at least one fakesign variant, got {applied:?}"
+        );
     }
 
     #[test]
