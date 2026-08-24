@@ -45,6 +45,10 @@ pub struct PlannedContent {
     pub files: Vec<PlacedFile>,
     /// Total decrypted size of the content's data (before encryption padding).
     pub data_len: u64,
+    /// Whether this content holds the injected game data (a `hif_*.nfs`). Retail tags these
+    /// contents in the FST with the title's own `owner_title_id`/`group_id`; framework contents
+    /// carry `owner 0`.
+    pub is_game: bool,
 }
 
 /// The full package plan: the serialized FST (content 0) and every content's file layout.
@@ -90,14 +94,16 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
     Ok(entries)
 }
 
-/// Plan the package layout from a staged build directory.
-pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
+/// Plan the package layout from a staged build directory. `title_id`/`group_id` tag the
+/// injected-game contents in the FST, matching retail titles.
+pub fn plan(build_dir: &Path, title_id: u64, group_id: u16) -> Result<PackagePlan> {
     // Content 0 is the FST; subsequent contents are allocated as we assign files.
     let mut contents: Vec<PlannedContent> = vec![PlannedContent {
         index: 0,
         content_type: TYPE_NONHASHED,
         files: Vec::new(),
         data_len: 0,
+        is_game: false,
     }];
 
     let new_content = |ct: u16, contents: &mut Vec<PlannedContent>| -> u16 {
@@ -107,6 +113,7 @@ pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
             content_type: ct,
             files: Vec::new(),
             data_len: 0,
+            is_game: false,
         });
         idx
     };
@@ -216,28 +223,60 @@ pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
         *end_index = total;
     }
 
-    // Compute FST secondary headers (cumulative content offsets in sectors).
-    let mut fst_contents = Vec::with_capacity(contents.len());
-    let mut cursor_sectors: u32 = 0;
-    for c in &contents {
-        let size_sectors = align_up(c.data_len.max(1), SECTOR) / SECTOR;
-        let (group_id, flags) = match c.content_type {
-            TYPE_HASHED => (0x0400u32, 0x0200u16),
-            _ => (0x0000, 0x0100),
-        };
-        fst_contents.push(FstContent {
-            offset_sectors: cursor_sectors,
-            size_sectors: size_sectors as u32,
-            owner_title_id: 0,
-            group_id,
-            flags,
-        });
-        cursor_sectors += size_sectors as u32;
-    }
+    // Compute the FST secondary headers. Retail conventions (verified against a retail title,
+    // see the module docs and the retail dump):
+    //   * content 0 (the FST itself) has a fully-zeroed secondary header;
+    //   * data-content offsets are cumulative in 0x8000 sectors, starting *after* the FST;
+    //   * the injected-game contents carry the title's own `owner_title_id`/`group_id`, while
+    //     framework contents carry `owner 0` (hashed → group 0x400, non-hashed → group 0).
+    // The FST's own byte length depends only on the (fixed) count of contents/nodes/names, not on
+    // the offset *values*, so we serialize once to measure it, then place data contents after it.
+    let build_headers = |base: u32, contents: &[PlannedContent]| -> Vec<FstContent> {
+        let mut v = Vec::with_capacity(contents.len());
+        let mut cursor = base;
+        for (i, c) in contents.iter().enumerate() {
+            if i == 0 {
+                v.push(FstContent {
+                    offset_sectors: 0,
+                    size_sectors: 0,
+                    owner_title_id: 0,
+                    group_id: 0,
+                    flags: 0,
+                });
+                continue;
+            }
+            let size_sectors = (align_up(c.data_len.max(1), SECTOR) / SECTOR) as u32;
+            let (owner, group, flags) = if c.is_game {
+                (title_id, group_id as u32, 0x0200u16)
+            } else if c.content_type == TYPE_HASHED {
+                (0, 0x0400, 0x0200)
+            } else {
+                (0, 0x0000, 0x0100)
+            };
+            v.push(FstContent {
+                offset_sectors: cursor,
+                size_sectors,
+                owner_title_id: owner,
+                group_id: group,
+                flags,
+            });
+            cursor += size_sectors;
+        }
+        v
+    };
 
+    // Pass 1: measure the serialized FST length (offset values don't affect the byte length).
+    let probe = Fst {
+        offset_factor: OFFSET_FACTOR,
+        contents: build_headers(0, &contents),
+        nodes: nodes.clone(),
+    };
+    let fst_sectors = (align_up(probe.serialize().len() as u64, SECTOR) / SECTOR) as u32;
+
+    // Pass 2: place data contents right after the FST region.
     let fst = Fst {
         offset_factor: OFFSET_FACTOR,
-        contents: fst_contents,
+        contents: build_headers(fst_sectors, &contents),
         nodes,
     };
     let fst_bytes = fst.serialize();
@@ -289,6 +328,7 @@ fn build_content_tree(
                     content_type: TYPE_HASHED,
                     files: Vec::new(),
                     data_len: 0,
+                    is_game: true,
                 });
                 (idx, 0x02)
             } else {
@@ -397,13 +437,44 @@ mod tests {
         std::fs::write(root.join("meta/meta.xml"), b"<menu/>").unwrap();
         std::fs::write(root.join("meta/iconTex.tga"), vec![3u8; 200]).unwrap();
 
-        let plan = plan(root).unwrap();
+        let title_id = 0x0005_0002_5253_5045u64;
+        let group_id = 0x5045u16;
+        let plan = plan(root, title_id, group_id).unwrap();
         // FST content + code content + rpx content + assets content + hif content + meta content
         assert!(plan.contents.len() >= 6);
         assert!(!plan.fst.is_empty());
 
         // FST must round-trip and contain the expected files.
         let parsed = Fst::parse(&plan.fst).unwrap();
+
+        // Content 0 (the FST itself) has a fully-zeroed secondary header (retail convention).
+        let c0 = &parsed.contents[0];
+        assert_eq!(c0.size_sectors, 0);
+        assert_eq!(c0.flags, 0);
+        assert_eq!(c0.group_id, 0);
+        assert_eq!(c0.owner_title_id, 0);
+
+        // The hif (game) content is tagged with the title's own owner/group; framework contents
+        // are not.
+        let hif_node = parsed
+            .nodes
+            .iter()
+            .find(|n| n.name == "hif_000000.nfs")
+            .unwrap();
+        let hif = &parsed.contents[hif_node.cluster as usize];
+        assert_eq!(
+            hif.owner_title_id, title_id,
+            "game content owner = title id"
+        );
+        assert_eq!(
+            hif.group_id, group_id as u32,
+            "game content group = title group"
+        );
+        // A framework content (content 1) is owned by nobody.
+        assert_eq!(parsed.contents[1].owner_title_id, 0);
+
+        // Data contents are placed after the FST region (offset 0 is only the FST's slot).
+        assert!(parsed.contents[1].offset_sectors >= 1);
         let names: Vec<_> = parsed.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"frisbiiU.rpx"));
         assert!(names.contains(&"hif_000000.nfs"));
