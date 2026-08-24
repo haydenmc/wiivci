@@ -353,27 +353,52 @@ fn resolve_title(config: &Config, game_id: &str) -> String {
     game_id.to_string()
 }
 
+/// Choose the GamePad (DRC) boot PNG: its own art if present, otherwise fall back to the TV
+/// image so both screens show a matching splash (`png_to_tga` resizes it to the DRC dimensions;
+/// both are 16:9, so there is no distortion). `None` when neither is available (keep the base's).
+fn drc_source(drc: Option<Vec<u8>>, tv: &Option<Vec<u8>>) -> Option<Vec<u8>> {
+    drc.or_else(|| tv.clone())
+}
+
 /// Write a boot texture from a user-supplied PNG, an online download, or leave the base's.
+///
+/// When no GamePad-specific art is found, the TV image is reused for `bootDrcTex` so both screens
+/// match (the community art repos usually only carry the TV image).
 fn resolve_textures(config: &Config, platform: &str, game_id: &str, meta_dir: &Path) -> Result<()> {
-    let jobs = [
-        (BootTexture::Icon, &config.icon_png),
-        (BootTexture::BootTv, &config.boot_tv_png),
-        (BootTexture::BootDrc, &config.boot_drc_png),
-    ];
-    for (tex, override_png) in jobs {
-        let png_bytes = if let Some(path) = override_png {
-            Some(std::fs::read(path).map_err(|e| Error::io(path, e))?)
-        } else if config.online {
-            artrepo::download_texture(platform, game_id, tex).unwrap_or(None)
-        } else {
-            None
+    // Resolve a texture's source PNG: an override path, else an online download, else None.
+    let resolve_src =
+        |tex: BootTexture, override_png: &Option<PathBuf>| -> Result<Option<Vec<u8>>> {
+            if let Some(path) = override_png {
+                Ok(Some(std::fs::read(path).map_err(|e| Error::io(path, e))?))
+            } else if config.online {
+                Ok(artrepo::download_texture(platform, game_id, tex).unwrap_or(None))
+            } else {
+                Ok(None)
+            }
         };
-        if let Some(bytes) = png_bytes {
-            let tga = png_to_tga(&bytes, tex)?;
-            let path = meta_dir.join(tex.filename());
-            std::fs::write(&path, tga).map_err(|e| Error::io(&path, e))?;
-            log::info!("wrote {}", tex.filename());
-        }
+    let write_tex = |tex: BootTexture, bytes: &[u8]| -> Result<()> {
+        let tga = png_to_tga(bytes, tex)?;
+        let path = meta_dir.join(tex.filename());
+        std::fs::write(&path, tga).map_err(|e| Error::io(&path, e))?;
+        log::info!("wrote {}", tex.filename());
+        Ok(())
+    };
+
+    if let Some(bytes) = resolve_src(BootTexture::Icon, &config.icon_png)? {
+        write_tex(BootTexture::Icon, &bytes)?;
+    }
+
+    let tv = resolve_src(BootTexture::BootTv, &config.boot_tv_png)?;
+    if let Some(bytes) = &tv {
+        write_tex(BootTexture::BootTv, bytes)?;
+    }
+
+    let drc_own = resolve_src(BootTexture::BootDrc, &config.boot_drc_png)?;
+    if drc_own.is_none() && tv.is_some() {
+        log::info!("no GamePad boot art found; reusing the TV image for bootDrcTex");
+    }
+    if let Some(bytes) = drc_source(drc_own, &tv) {
+        write_tex(BootTexture::BootDrc, &bytes)?;
     }
     Ok(())
 }
@@ -398,5 +423,28 @@ fn update_rvlt_tmd(tmd: &mut [u8], content_hash: &[u8; 20]) {
     if tmd.len() >= CONTENT0_HASH + 20 {
         tmd[WII_SIG].fill(0);
         tmd[CONTENT0_HASH..CONTENT0_HASH + 20].copy_from_slice(content_hash);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drc_uses_own_art_when_present() {
+        let drc = Some(vec![1, 2, 3]);
+        let tv = Some(vec![9, 9]);
+        assert_eq!(drc_source(drc, &tv), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn drc_falls_back_to_tv_when_absent() {
+        let tv = Some(vec![9, 9]);
+        assert_eq!(drc_source(None, &tv), Some(vec![9, 9]));
+    }
+
+    #[test]
+    fn drc_is_none_when_neither_present() {
+        assert_eq!(drc_source(None, &None), None);
     }
 }
