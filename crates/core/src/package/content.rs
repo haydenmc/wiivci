@@ -112,10 +112,12 @@ pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
     };
 
     // --- code/ ---
+    // Each code file gets its OWN content, matching the layout of retail Wii-VC titles and the
+    // working TeconMoon/UWUVCI injects. Bundling several code files (notably fw.img) into one
+    // content produces a layout the Wii U installer rejects (it hangs partway through that content).
     let code_dir = build_dir.join("code");
     let mut code_children = Vec::new();
     if code_dir.is_dir() {
-        let code_content = new_content(TYPE_NONHASHED, &mut contents);
         for entry in read_dir_sorted(&code_dir)? {
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
@@ -123,12 +125,7 @@ pub fn plan(build_dir: &Path) -> Result<PackagePlan> {
                 continue;
             }
             let size = entry.metadata().map_err(|e| Error::io(&path, e))?.len();
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let cluster = if ext == "rpx" || ext == "rpl" {
-                new_content(TYPE_NONHASHED, &mut contents)
-            } else {
-                code_content
-            };
+            let cluster = new_content(TYPE_NONHASHED, &mut contents);
             code_children.push(Tree::File {
                 name,
                 path,
@@ -414,7 +411,7 @@ mod tests {
             .find(|n| n.name == "hif_000000.nfs")
             .unwrap();
         assert_eq!(hif.type_flags, 0x02);
-        // app.xml and cos.xml share the code content; frisbiiU.rpx is separate.
+        // Each code file gets its own content (matching retail/TeconMoon layout).
         let app = parsed.nodes.iter().find(|n| n.name == "app.xml").unwrap();
         let cos = parsed.nodes.iter().find(|n| n.name == "cos.xml").unwrap();
         let rpx = parsed
@@ -422,7 +419,7 @@ mod tests {
             .iter()
             .find(|n| n.name == "frisbiiU.rpx")
             .unwrap();
-        assert_eq!(app.cluster, cos.cluster);
+        assert_ne!(app.cluster, cos.cluster, "each code file gets its own content");
         assert_ne!(app.cluster, rpx.cluster);
     }
 }
