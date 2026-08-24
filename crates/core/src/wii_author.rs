@@ -327,6 +327,8 @@ pub fn author_gc_disc(
             header_patches: Vec::new(),
             edits: Vec::new(),
         }],
+        // The authored disc already has a single DATA partition and a matching table.
+        disc_patches: Vec::new(),
         rvlt_content_hash: Some(content_hash),
         applied: Vec::new(),
     };

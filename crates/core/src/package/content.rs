@@ -419,7 +419,10 @@ mod tests {
             .iter()
             .find(|n| n.name == "frisbiiU.rpx")
             .unwrap();
-        assert_ne!(app.cluster, cos.cluster, "each code file gets its own content");
+        assert_ne!(
+            app.cluster, cos.cluster,
+            "each code file gets its own content"
+        );
         assert_ne!(app.cluster, rpx.cluster);
     }
 }

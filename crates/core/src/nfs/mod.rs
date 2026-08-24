@@ -17,7 +17,7 @@ use std::path::Path;
 
 use crate::disc_patch::{apply_edits_to_group, recompute_group, DiscPlan, PartitionPlan};
 use crate::error::{Error, Result};
-use crate::input::{DecryptedDisc, PartitionSpan, DISC_SECTOR_SIZE};
+use crate::input::{DecryptedDisc, DISC_SECTOR_SIZE};
 use eggs::{EggsHeader, LbaRange};
 use split::SplitWriter;
 
@@ -42,10 +42,9 @@ pub struct NfsStats {
 /// * one range per partition: `{start_sector, data_end_sector - start_sector}` — each
 ///   partition's ticket/TMD/cert/H3 header followed by its decrypted cluster data.
 ///
-/// Everything else (large inter-partition gaps) is an implicit run of zeros. All partitions
-/// are preserved so the stored logical disc is bit-identical to the retail dump; trimming to
-/// the data partition alone is a future size optimization.
-fn structural_ranges(spans: &[PartitionSpan]) -> Vec<LbaRange> {
+/// Everything else (large inter-partition gaps, the dropped UPDATE partition) is an implicit run
+/// of zeros. Ranges come from the [`DiscPlan`], which lists only the data partition.
+fn structural_ranges(partitions: &[PartitionPlan]) -> Vec<LbaRange> {
     let mut ranges = vec![
         LbaRange {
             start_sector: 0,
@@ -56,10 +55,10 @@ fn structural_ranges(spans: &[PartitionSpan]) -> Vec<LbaRange> {
             num_sectors: 2,
         },
     ];
-    for span in spans {
+    for p in partitions {
         ranges.push(LbaRange {
-            start_sector: span.start_sector,
-            num_sectors: span.data_end_sector - span.start_sector,
+            start_sector: p.start_sector,
+            num_sectors: p.data_end_sector - p.start_sector,
         });
     }
     ranges
@@ -77,8 +76,7 @@ pub fn build_nfs<D: DecryptedDisc + ?Sized>(
     out_dir: &Path,
     plan: &DiscPlan,
 ) -> Result<NfsStats> {
-    let spans = source.partition_spans().to_vec();
-    let ranges = structural_ranges(&spans);
+    let ranges = structural_ranges(&plan.partitions);
     let header = EggsHeader::new(ranges.clone())?;
 
     let mut writer = SplitWriter::new(out_dir)?;
@@ -96,14 +94,14 @@ pub fn build_nfs<D: DecryptedDisc + ?Sized>(
         {
             Some(pp) => write_partition(&mut writer, disc, htk, pp, disc_size)?,
             None => {
-                // Disc header / partition table: copied verbatim.
+                // Disc header / partition table: copied verbatim, with the disc-level patches
+                // (rewritten partition table) spliced in.
                 for s in range.start_sector..range.start_sector + range.num_sectors {
-                    read_sector(
-                        disc,
-                        s as u64 * DISC_SECTOR_SIZE as u64,
-                        disc_size,
-                        &mut sector,
-                    )?;
+                    let sec_start = s as u64 * DISC_SECTOR_SIZE as u64;
+                    read_sector(disc, sec_start, disc_size, &mut sector)?;
+                    for (off, bytes) in &plan.disc_patches {
+                        splice(&mut sector, sec_start, *off, bytes);
+                    }
                     crypto::encrypt_sector(htk, s, &mut sector);
                     writer.write_all(&sector)?;
                 }
