@@ -9,11 +9,14 @@ use std::process::ExitCode;
 use anyhow::{anyhow, Context, Result};
 use clap::{ArgGroup, Parser, ValueEnum};
 
+use wiivci_core::assets::nintendont;
 use wiivci_core::base::{open_base, BaseSource};
+use wiivci_core::input::{probe, DiscKind};
 use wiivci_core::keys::WiiUCommonKey;
+use wiivci_core::nincfg::{Language, VideoMode};
 use wiivci_core::nus::{NusBase, NusClient};
 use wiivci_core::package::cert::CertChain;
-use wiivci_core::pipeline::{self, Config, Region};
+use wiivci_core::pipeline::{self, Config, GameCubeOptions, Region};
 use wiivci_core::video::VideoPatches;
 
 /// Inject a Wii game (ISO/RVZ) into an installable Wii U Virtual Console package.
@@ -98,9 +101,62 @@ struct Cli {
     #[arg(long)]
     remove_dithering: bool,
 
+    /// Force GameCube (Nintendont) mode. Normally auto-detected from the input image.
+    #[arg(long)]
+    gamecube: bool,
+
+    /// GameCube: Nintendont `boot.dol` to embed (default: downloaded, pinned build).
+    #[arg(long, value_name = "DOL")]
+    nintendont: Option<PathBuf>,
+
+    /// GameCube: Wii `apploader.img` for the synthetic disc. Required to boot on hardware.
+    #[arg(long, value_name = "IMG")]
+    apploader: Option<PathBuf>,
+
+    /// GameCube: force 16:9 widescreen (written to nincfg.bin).
+    #[arg(long)]
+    widescreen: bool,
+
+    /// GameCube: game language (written to nincfg.bin).
+    #[arg(long, value_enum, default_value_t = GcLangArg::Auto)]
+    gc_language: GcLangArg,
+
+    /// GameCube: disable emulated memory card.
+    #[arg(long)]
+    no_memcard: bool,
+
+    /// GameCube: SD path to a Gecko cheat file (`.gct`); enables cheats in nincfg.bin.
+    #[arg(long, value_name = "SDPATH")]
+    cheats: Option<String>,
+
     /// Keep the intermediate build directory instead of deleting it.
     #[arg(long, value_name = "DIR")]
     work_dir: Option<PathBuf>,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum GcLangArg {
+    Auto,
+    English,
+    German,
+    French,
+    Spanish,
+    Italian,
+    Dutch,
+}
+
+impl From<GcLangArg> for Language {
+    fn from(l: GcLangArg) -> Self {
+        match l {
+            GcLangArg::Auto => Language::Auto,
+            GcLangArg::English => Language::English,
+            GcLangArg::German => Language::German,
+            GcLangArg::French => Language::French,
+            GcLangArg::Spanish => Language::Spanish,
+            GcLangArg::Italian => Language::Italian,
+            GcLangArg::Dutch => Language::Dutch,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -163,6 +219,40 @@ fn build_base(cli: &Cli, wiiu_common_key: &WiiUCommonKey) -> Result<Box<dyn Base
     )))
 }
 
+/// Resolve GameCube (Nintendont) options: obtain Nintendont's `boot.dol` (a local file or a
+/// pinned download) and the optional apploader, plus nincfg settings.
+fn build_gc_options(cli: &Cli) -> Result<GameCubeOptions> {
+    let nintendont_dol = match &cli.nintendont {
+        Some(path) => std::fs::read(path)
+            .with_context(|| format!("reading Nintendont dol {}", path.display()))?,
+        None => {
+            if cli.offline {
+                return Err(anyhow!(
+                    "--nintendont <boot.dol> is required with --offline (cannot download Nintendont)"
+                ));
+            }
+            nintendont::download_boot_dol().context(
+                "downloading Nintendont (supply one with --nintendont to avoid the network)",
+            )?
+        }
+    };
+    let apploader = match &cli.apploader {
+        Some(path) => {
+            std::fs::read(path).with_context(|| format!("reading apploader {}", path.display()))?
+        }
+        None => Vec::new(),
+    };
+    Ok(GameCubeOptions {
+        nintendont_dol,
+        apploader,
+        widescreen: cli.widescreen,
+        language: cli.gc_language.into(),
+        video_mode: VideoMode::Auto,
+        memcard_emu: !cli.no_memcard,
+        cheat_path: cli.cheats.clone(),
+    })
+}
+
 /// Load a key from either an inline hex string or a file path.
 fn load_wiiu_key(arg: &str) -> Result<WiiUCommonKey> {
     let path = std::path::Path::new(arg);
@@ -182,6 +272,17 @@ fn run() -> Result<()> {
         .with_context(|| format!("loading certificate chain {}", cli.cert.display()))?;
     let base = build_base(&cli, &wiiu_common_key)?;
 
+    // GameCube mode: explicit flag or auto-detected from the input image.
+    let is_gamecube = cli.gamecube || matches!(probe(&cli.input), Ok(DiscKind::GameCube));
+    if is_gamecube && (cli.deflicker || cli.half_vfilter || cli.remove_dithering) {
+        eprintln!("note: --deflicker/--half-vfilter/--remove-dithering are Wii-only and ignored for GameCube");
+    }
+    let gamecube = if is_gamecube {
+        Some(build_gc_options(&cli)?)
+    } else {
+        None
+    };
+
     let config = Config {
         input: cli.input,
         base,
@@ -200,6 +301,7 @@ fn run() -> Result<()> {
             half_vfilter: cli.half_vfilter,
             dithering: cli.remove_dithering,
         },
+        gamecube,
     };
 
     // Use a caller-provided work dir, or a temp dir cleaned up on completion.
@@ -228,6 +330,11 @@ fn run() -> Result<()> {
     println!("  Output:    {}", summary.out.display());
     println!("\nInstall the output folder with WUP Installer GX2 (sd:/install/<name>/).");
     println!("The target console needs signature patches (Aroma/Tiramisu) to install and boot.");
+    if is_gamecube {
+        println!(
+            "GameCube: also copy the generated nincfg.bin (next to the output) to your SD card root."
+        );
+    }
     Ok(())
 }
 

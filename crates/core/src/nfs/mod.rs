@@ -17,7 +17,7 @@ use std::path::Path;
 
 use crate::disc_patch::{apply_edits_to_group, recompute_group, DiscPlan, PartitionPlan};
 use crate::error::{Error, Result};
-use crate::input::{SourceDisc, DISC_SECTOR_SIZE};
+use crate::input::{DecryptedDisc, PartitionSpan, DISC_SECTOR_SIZE};
 use eggs::{EggsHeader, LbaRange};
 use split::SplitWriter;
 
@@ -45,7 +45,7 @@ pub struct NfsStats {
 /// Everything else (large inter-partition gaps) is an implicit run of zeros. All partitions
 /// are preserved so the stored logical disc is bit-identical to the retail dump; trimming to
 /// the data partition alone is a future size optimization.
-fn structural_ranges(source: &SourceDisc) -> Vec<LbaRange> {
+fn structural_ranges(spans: &[PartitionSpan]) -> Vec<LbaRange> {
     let mut ranges = vec![
         LbaRange {
             start_sector: 0,
@@ -56,7 +56,7 @@ fn structural_ranges(source: &SourceDisc) -> Vec<LbaRange> {
             num_sectors: 2,
         },
     ];
-    for span in source.partitions() {
+    for span in spans {
         ranges.push(LbaRange {
             start_sector: span.start_sector,
             num_sectors: span.data_end_sector - span.start_sector,
@@ -71,13 +71,14 @@ fn structural_ranges(source: &SourceDisc) -> Vec<LbaRange> {
 /// per-partition Wii hash-tree rebuild — RVZ/WIA sources zero the per-cluster hash blocks, so
 /// they are recomputed here — and any `main.dol` video patches. Returns statistics about the
 /// files written.
-pub fn build_nfs(
-    source: &mut SourceDisc,
+pub fn build_nfs<D: DecryptedDisc + ?Sized>(
+    source: &mut D,
     htk: &[u8; 16],
     out_dir: &Path,
     plan: &DiscPlan,
 ) -> Result<NfsStats> {
-    let ranges = structural_ranges(source);
+    let spans = source.partition_spans().to_vec();
+    let ranges = structural_ranges(&spans);
     let header = EggsHeader::new(ranges.clone())?;
 
     let mut writer = SplitWriter::new(out_dir)?;
@@ -85,7 +86,7 @@ pub fn build_nfs(
 
     let disc_size = source.disc_size();
     let mut sector = vec![0u8; DISC_SECTOR_SIZE];
-    let disc = source.stream();
+    let disc = source.disc_stream();
 
     for range in &ranges {
         match plan
@@ -122,7 +123,7 @@ pub fn build_nfs(
 /// Write one partition: its pre-data header region verbatim (with `header_patches` spliced in),
 /// then its cluster data with the Wii hash tree rebuilt group-by-group and `main.dol` edits
 /// applied.
-fn write_partition<R: Read + Seek>(
+fn write_partition<R: Read + Seek + ?Sized>(
     writer: &mut SplitWriter,
     disc: &mut R,
     htk: &[u8; 16],
@@ -186,7 +187,7 @@ fn splice(sector: &mut [u8], sec_start: u64, patch_off: u64, bytes: &[u8]) {
 }
 
 /// Read one 0x8000 sector at `offset` from the decrypted disc, zero-padding a short/OOB read.
-fn read_sector<R: Read + Seek>(
+fn read_sector<R: Read + Seek + ?Sized>(
     disc: &mut R,
     offset: u64,
     disc_size: u64,
@@ -207,6 +208,7 @@ fn read_sector<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::SourceDisc;
 
     /// End-to-end oracle: encode a real Wii disc to NFS (rebuilding the Wii hash tree), then
     /// reopen it with `nod`'s hash **validation** enabled and confirm the whole data partition

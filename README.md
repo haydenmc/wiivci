@@ -1,7 +1,8 @@
 # wiivci
 
-A cross-platform CLI that injects Wii games (ISO/RVZ/WBFS/…) into Wii U Virtual Console
-titles — producing an installable WUP package you can sideload with
+A cross-platform CLI that injects Wii games (ISO/RVZ/WBFS/…) **and GameCube games (via
+[Nintendont](https://github.com/FIX94/Nintendont))** into Wii U Virtual Console titles —
+producing an installable WUP package you can sideload with
 [WUP Installer GX2](https://github.com/FIX94/wup-installer-gx2). It fills the same role as
 TeconmoonWiiVCInjector and UWUVCI, but is a single self-contained Rust binary with **no hard
 dependency on external tools** (`wit`, `nfs2iso2nfs`, `NUSPacker`, `CDecrypt`, `png2tgacmd`,
@@ -55,6 +56,39 @@ These edit the game executable inside the disc, so the tool relocates `main.dol`
 patch, and rebuilds the Wii partition hash tree over the affected clusters (updating the H3
 table and re-fakesigning `rvlt.tmd`). A requested patch whose signature isn't present in a given
 game is skipped with a warning.
+
+### GameCube games (Nintendont)
+
+Point `--input` at a GameCube image (ISO/GCM/CISO/NKit/GCZ/RVZ — anything `nod` reads) and the
+tool switches to the GameCube path automatically (or force it with `--gamecube`):
+
+```sh
+wiivci \
+  --input "Super Monkey Ball 2 (USA).rvz" \
+  --base  "Rhythm Heaven Fever [00050000101B0700].wua" \
+  --out   ./out \
+  --wiiu-common-key <32-hex> --cert ./title.cert \
+  --title "Super Monkey Ball 2" \
+  --widescreen
+```
+
+A GameCube inject is, at the WUP level, a normal Wii VC title: the tool authors a small synthetic
+Wii disc whose `main.dol` is **Nintendont** and whose filesystem holds the GameCube image as
+`files/game.iso`. Nintendont boots and runs the game from the emulated disc. The **same Wii VC base**
+is used as for Wii injects.
+
+Alongside the WUP package the tool writes a **`nincfg.bin`** (Nintendont's config) next to the
+output — **copy it to your SD card root**. Options that shape it: `--widescreen`, `--gc-language`,
+`--no-memcard`, and `--cheats <sd-path-to-.gct>`.
+
+Nintendont's `boot.dol` is downloaded automatically (a pinned build); supply your own with
+`--nintendont <boot.dol>` (required with `--offline`). Booting on real hardware also needs a Wii
+**apploader** in the synthetic disc — supply one with `--apploader <apploader.img>` (e.g. the
+open-source [HackMii/gc-linux apploader](https://hackmii.com/2008/08/open-source-apploader-iso-template/)).
+Without it the package is structurally valid (and verifies against `nod`) but will not boot.
+
+Nintendont handles video, controllers and widescreen, so the Wii `--deflicker`/`--half-vfilter`/
+`--remove-dithering` patches do not apply to GameCube titles.
 
 ### Downloading the base from NUS
 
@@ -118,9 +152,10 @@ Cross-validation tests are `#[ignore]`d and require local reference files plus
 
 ## Scope
 
-v1 targets Wii ISO/RVZ → WUP with core options and the `main.dol` video patches above. Not yet
-implemented: `fw.img` controller-remap patches, video-mode/region disc patches, the
-GameCube/Nintendont path, and cheats.
+v1 targets Wii ISO/RVZ → WUP with core options and the `main.dol` video patches above, plus
+GameCube → WUP via Nintendont (synthetic Wii disc + `nincfg.bin`). Not yet implemented: `fw.img`
+controller-remap patches, video-mode/region disc patches for Wii, Wii U GamePad passthrough for
+Nintendont, and multi-disc GameCube titles.
 
 ## Acknowledgements
 
@@ -138,6 +173,14 @@ projects; they were consulted for file-format facts and byte-level constants, cr
 * [**TeconmoonWiiVCInjector**](https://github.com/piratesephiroth/TeconmoonWiiVCInjector) and
   [**UWUVCI-V3**](https://github.com/AboodXD/UWUVCI-V3) — the injectors whose functionality this
   mirrors; consulted for WUP packaging and NFS conventions.
+* [**Nintendont**](https://github.com/FIX94/Nintendont) (FIX94) — the GameCube loader that boots
+  inside the injected Wii disc; its `NIN_CFG` layout informed our `nincfg.bin` generator.
+* [**nfs2iso2nfs**](https://github.com/FIX94/nfs2iso2nfs) — the reference for the homebrew `fw.img`
+  patches (fakesign / AHBPROT / MEMPROT) applied for the Nintendont path.
+* [**gc-wiiu-injector**](https://github.com/andrewmunro/gc-wiiu-injector) — a reference for the
+  overall GameCube-via-Nintendont synthetic-disc approach.
+* The [**HackMii / gc-linux open-source apploader**](https://hackmii.com/2008/08/open-source-apploader-iso-template/)
+  — the redistributable Wii apploader recommended for the synthetic disc (user-supplied).
 * [**WUP Installer GX2**](https://github.com/FIX94/wup-installer-gx2) — the on-console installer the
   output targets.
 * [WiiBrew](https://wiibrew.org/wiki/Wii_disc) and GBAtemp threads — Wii disc / WUP / NFS format
