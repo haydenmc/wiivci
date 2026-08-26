@@ -42,7 +42,8 @@ console needs signature patches (Aroma/Tiramisu/Mocha) to install and boot fakes
 
 Useful options: `--icon/--boot-tv/--boot-drc <png>` to supply artwork, `--region jp|us|eu`,
 `--no-gamepad`, `--offline` (skip GameTDB/art lookups), `--work-dir <dir>` (keep the
-intermediate build tree).
+intermediate build tree). If no GamePad boot image is found (community art repos usually only
+carry the TV image), the TV image is reused for the GamePad splash so both screens match.
 
 ### Video patches
 
