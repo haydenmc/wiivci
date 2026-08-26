@@ -19,3 +19,6 @@ keys.txt
 
 # Editor / OS
 .DS_Store
+
+# Local sample injects (build artifacts)
+/build_*/
