@@ -45,6 +45,19 @@ Useful options: `--icon/--boot-tv/--boot-drc <png>` to supply artwork, `--region
 intermediate build tree). If no GamePad boot image is found (community art repos usually only
 carry the TV image), the TV image is reused for the GamePad splash so both screens match.
 
+### Install hangs at a fixed point with no error?
+
+If WUP Installer GX2 freezes at the same early byte offset every time (no error message), the most
+likely cause is **a conflicting title already on the console**, not the package. An earlier
+interrupted install of the same game leaves a partial title with the same title ID; every retry then
+collides with it and hangs. It often shows in **Data Management** as an unnamed (`???`) entry whose
+size is roughly your package size, sometimes with a lingering Wii U menu icon.
+
+Fix: delete that orphaned entry in Data Management (verify it's the unnamed one at ~your package's
+size, then reboot if the icon lingers) and install again onto a target with enough free space. A big
+title needs its full size free on the destination — the internal system memory usually can't hold a
+multi-GB inject, so install to USB.
+
 ### Video patches
 
 Optional patches to the game's `main.dol` (the same ones UWUVCI offers), for a sharper picture:
