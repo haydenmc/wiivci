@@ -14,6 +14,12 @@
 //!
 //! Sectors not covered by any LBA range are implicit runs of zeros — this is how the
 //! format stores a multi-GB disc image sparsely.
+//!
+//! **Unused LBA-range slots must be filled with `0xFF`, not `0x00`.** The Wii U's `fw.img`
+//! treats `0xFFFFFFFF` as the range-table terminator when it mounts the disc at boot; a `0x00`
+//! fill reads as a bogus `{start: 0, num: 0}` range and hangs the emulator. (`nod`'s reader uses
+//! `num_lba_ranges` and is lenient about the fill, so a `0x00`-padded header still round-trips —
+//! it just won't boot on hardware. This bit us: installs fine, hangs on launch.)
 
 use byteorder::{BigEndian, WriteBytesExt};
 
@@ -65,6 +71,10 @@ impl EggsHeader {
     /// Serialize to the fixed 0x200-byte header.
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
+        // Unused LBA-range slots must read as 0xFF (the terminator fw.img expects); fill the whole
+        // range-table region first, then overwrite the used slots below.
+        const RANGES_OFF: usize = 0x14;
+        buf[RANGES_OFF..HEADER_SIZE - 4].fill(0xFF);
         {
             let mut cursor = &mut buf[..];
             cursor.write_all(MAGIC).unwrap();
@@ -123,6 +133,9 @@ mod tests {
         // range 2
         assert_eq!(&bytes[36..40], &[0, 0, 0, 10]);
         assert_eq!(&bytes[40..44], &[0, 0, 0x12, 0x34]);
+        // unused range slots are 0xFF-filled (the terminator fw.img expects), up to the trailer.
+        assert_eq!(&bytes[44..48], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(bytes[44..0x1FC].iter().all(|&b| b == 0xFF));
         // trailer
         assert_eq!(&bytes[0x1FC..0x200], b"SGGE");
         assert_eq!(bytes.len(), 0x200);

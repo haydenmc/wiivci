@@ -68,14 +68,21 @@ pub struct PartitionPlan {
     /// `main.dol` edits, as (logical partition-data offset, replacement bytes). Data partition
     /// only; empty otherwise.
     pub edits: Vec<(u64, Vec<u8>)>,
+    /// Runs of 64-cluster hash groups (0-based within the data region) that hold real data and
+    /// must be stored; the rest are inter-file gaps skipped in the NFS (sparse storage, no
+    /// compaction). Empty means "store every group" (used by the synthetic GC disc).
+    pub stored_data_groups: Vec<(u32, u32)>,
 }
 
 /// A whole-disc rebuild plan: how to rebuild each partition's Wii hash tree (and apply any
 /// `main.dol` edits) while streaming the NFS.
 #[derive(Clone)]
 pub struct DiscPlan {
-    /// One entry per partition, matched to a structural range by `start_sector`.
+    /// One entry per stored partition, matched to a structural range by `start_sector`.
     pub partitions: Vec<PartitionPlan>,
+    /// Byte-range overlays applied to the disc-level (non-partition) sectors — used to rewrite the
+    /// partition table so it lists only the data partition. Keyed by absolute disc byte offset.
+    pub disc_patches: Vec<(u64, Vec<u8>)>,
     /// New content hash for the emitted `rvlt.tmd`, set only when the data partition was patched.
     pub rvlt_content_hash: Option<[u8; 20]>,
     /// Names of the video patches that matched and were applied.
@@ -137,18 +144,52 @@ fn read_at<R: Read + Seek>(disc: &mut R, offset: u64, out: &mut [u8]) -> Result<
 
 // Offsets within the partition header (at `start_sector * SECTOR`).
 const TMD_OFF_FIELD: u64 = 0x2A8; // u32, stored >> 2
-const TMD_SIG: std::ops::Range<usize> = 0x004..0x104; // RSA-2048 signature (zeroed to fakesign)
+const SIG: std::ops::Range<usize> = 0x004..0x104; // RSA-2048 signature (zeroed to fakesign)
 const TMD_CONTENT0_HASH: usize = 0x1F4; // Wii TMD single content hash
 
-/// Plan the whole-disc hash rebuild (and any `main.dol` video patches).
+// The partition's own ticket sits at the partition start (offset 0); its signature shares the
+// same 0x004..0x104 layout as the TMD's.
+const TICKET_SIG: std::ops::Range<usize> = SIG;
+const TMD_SIG: std::ops::Range<usize> = SIG;
+
+// Disc-level region info: the per-organisation age ratings (zeroed by the reference injectors).
+const REGION_AGE_RATINGS_OFF: u64 = 0x4E010;
+const REGION_AGE_RATINGS_LEN: usize = 0x10;
+
+/// Byte offsets of the disc partition table (a Wii inject keeps only the DATA partition).
+const PARTITION_GROUPS_OFF: u64 = 0x40000; // four 8-byte group entries
+const PARTITION_INFO_OFF: u64 = 0x40020; // partition info entries (8 bytes each)
+
+/// Rewrite the partition table to list a single DATA partition at `data_part_off` (byte offset).
+/// A retail Wii disc has an UPDATE partition (a system-update IOS) before the game partition; a
+/// VC inject must present only the data partition, or the Wii U's emulator hangs at boot.
+fn partition_table_patches(data_part_off: u64) -> Vec<(u64, Vec<u8>)> {
+    // Group table: group 0 has one partition, its info table at PARTITION_INFO_OFF; groups 1..3
+    // are empty. (0x20 bytes total, overwriting any UPDATE-partition group entry.)
+    let mut groups = vec![0u8; 0x20];
+    groups[0..4].copy_from_slice(&1u32.to_be_bytes());
+    groups[4..8].copy_from_slice(&((PARTITION_INFO_OFF >> 2) as u32).to_be_bytes());
+    // Info table: entry 0 = { partition_offset >> 2, type = 0 (DATA) }; the remaining three entry
+    // slots are cleared so a stale second entry from the source disc can't linger (the reference
+    // injectors leave only one entry). 0x20 bytes = four 8-byte entries.
+    let mut info = vec![0u8; 0x20];
+    info[0..4].copy_from_slice(&((data_part_off >> 2) as u32).to_be_bytes());
+    vec![
+        (PARTITION_GROUPS_OFF, groups),
+        (PARTITION_INFO_OFF, info),
+        (REGION_AGE_RATINGS_OFF, vec![0u8; REGION_AGE_RATINGS_LEN]),
+    ]
+}
+
+/// Plan the disc rebuild (and any `main.dol` video patches).
 ///
-/// `build_nfs` streams the disc once and rebuilds every partition's per-cluster hash blocks
-/// (RVZ/WIA sources zero them). The partition H3 tables are already valid (read via `nod`);
-/// for the data partition we additionally apply the `main.dol` edits, recompute the affected
-/// groups' H3 entries, and fix the embedded TMD, returning the new `rvlt.tmd` content hash.
+/// Only the **data (game) partition** is stored — the retail UPDATE partition is dropped and the
+/// partition table rewritten to list just the data partition, matching how the reference injectors
+/// build a bootable VC disc. `build_nfs` streams the data partition once and rebuilds its per-cluster
+/// hash blocks (RVZ/WIA sources zero them); the H3 table is valid via `nod`. Any `main.dol` edits
+/// recompute the affected groups' H3 and re-fakesign the embedded TMD.
 pub fn plan_disc(source: &mut SourceDisc, patches: &VideoPatches) -> Result<DiscPlan> {
-    let spans = source.partitions().to_vec();
-    let data_start_sector = source.data_partition().start_sector;
+    let span = source.data_partition();
 
     // Data-partition main.dol edits (logical offsets), if any pattern matched.
     let mut edits: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -163,82 +204,91 @@ pub fn plan_disc(source: &mut SourceDisc, patches: &VideoPatches) -> Result<Disc
         }
     }
 
-    let mut partitions = Vec::with_capacity(spans.len());
-    let mut rvlt_content_hash = None;
+    let part_base = span.start_sector as u64 * SECTOR as u64;
+    let mut off_field = [0u8; 4];
+    read_at(
+        source.stream(),
+        part_base + H3_TABLE_OFF_FIELD,
+        &mut off_field,
+    )?;
+    let h3_base = part_base + ((be32(&off_field) as u64) << 2);
 
-    for span in &spans {
-        let part_base = span.start_sector as u64 * SECTOR as u64;
-        let mut off_field = [0u8; 4];
-        read_at(
-            source.stream(),
-            part_base + H3_TABLE_OFF_FIELD,
-            &mut off_field,
-        )?;
-        let h3_base = part_base + ((be32(&off_field) as u64) << 2);
+    // The H3 table is valid on disc even for RVZ; use it as the base.
+    let mut h3_table = source.partition_h3_table(span.index)?;
+    let mut header_patches: Vec<(u64, Vec<u8>)> = Vec::new();
 
-        // The H3 table is valid on disc even for RVZ; use it as the base.
-        let mut h3_table = source.partition_h3_table(span.index)?;
-        let mut header_patches: Vec<(u64, Vec<u8>)> = Vec::new();
-
-        let is_data = span.start_sector == data_start_sector;
-        let part_edits = if is_data { edits.clone() } else { Vec::new() };
-
-        if is_data && !part_edits.is_empty() {
-            // Recompute the H3 of each group an edit touches so the H3 table stays consistent.
-            let total = (span.data_end_sector - span.data_start_sector) as u64;
-            let mut groups: BTreeSet<u32> = BTreeSet::new();
-            for (off, bytes) in &part_edits {
-                let first = off / DATA as u64;
-                let last = (off + bytes.len() as u64 - 1) / DATA as u64;
-                for ps in first..=last {
-                    groups.insert((ps / SECTORS_PER_GROUP as u64) as u32);
-                }
+    if !edits.is_empty() {
+        // Recompute the H3 of each group an edit touches so the H3 table stays consistent.
+        let total = (span.data_end_sector - span.data_start_sector) as u64;
+        let mut groups: BTreeSet<u32> = BTreeSet::new();
+        for (off, bytes) in &edits {
+            let first = off / DATA as u64;
+            let last = (off + bytes.len() as u64 - 1) / DATA as u64;
+            for ps in first..=last {
+                groups.insert((ps / SECTORS_PER_GROUP as u64) as u32);
             }
-            for &g in &groups {
-                let mut clusters = vec![[0u8; SECTOR]; SECTORS_PER_GROUP];
-                for (k, cluster) in clusters.iter_mut().enumerate() {
-                    let ps = g as u64 * SECTORS_PER_GROUP as u64 + k as u64;
-                    if ps < total {
-                        read_at(
-                            source.stream(),
-                            (span.data_start_sector as u64 + ps) * SECTOR as u64,
-                            cluster,
-                        )?;
-                    }
-                }
-                apply_edits_to_group(&mut clusters, g, &part_edits);
-                let h3 = recompute_group(&mut clusters);
-                h3_table[g as usize * 20..g as usize * 20 + 20].copy_from_slice(&h3);
-            }
-
-            let content_hash = sha1(&h3_table);
-            rvlt_content_hash = Some(content_hash);
-
-            // Fix the embedded TMD (content hash + fakesign) to match the rebuilt H3 table.
-            let mut tmd_off = [0u8; 4];
-            read_at(source.stream(), part_base + TMD_OFF_FIELD, &mut tmd_off)?;
-            let tmd_base = part_base + ((be32(&tmd_off) as u64) << 2);
-            header_patches.push((tmd_base + TMD_SIG.start as u64, vec![0u8; TMD_SIG.len()]));
-            header_patches.push((tmd_base + TMD_CONTENT0_HASH as u64, content_hash.to_vec()));
         }
-
-        // Always (re)write the valid H3 table so we don't depend on the stream's copy.
-        header_patches.push((h3_base, h3_table));
-
-        partitions.push(PartitionPlan {
-            start_sector: span.start_sector,
-            data_start_sector: span.data_start_sector,
-            data_end_sector: span.data_end_sector,
-            header_patches,
-            edits: part_edits,
-        });
+        for &g in &groups {
+            let mut clusters = vec![[0u8; SECTOR]; SECTORS_PER_GROUP];
+            for (k, cluster) in clusters.iter_mut().enumerate() {
+                let ps = g as u64 * SECTORS_PER_GROUP as u64 + k as u64;
+                if ps < total {
+                    read_at(
+                        source.stream(),
+                        (span.data_start_sector as u64 + ps) * SECTOR as u64,
+                        cluster,
+                    )?;
+                }
+            }
+            apply_edits_to_group(&mut clusters, g, &edits);
+            let h3 = recompute_group(&mut clusters);
+            h3_table[g as usize * 20..g as usize * 20 + 20].copy_from_slice(&h3);
+        }
     }
+
+    // The partition's content hash is SHA1 of the (possibly rebuilt) H3 table. This is unchanged
+    // from the source when there were no edits.
+    let content_hash = sha1(&h3_table);
+    let rvlt_content_hash = Some(content_hash);
+
+    // Fakesign the partition's OWN in-disc ticket and TMD (zero the RSA signatures) and set the
+    // TMD's content hash. The Wii U's patched fw.img accepts a zeroed signature and *rejects* a
+    // real one, so the partition must be fakesigned in place — not just the external rvlt.tik/tmd
+    // — or the emulator hangs at boot even though the disc is otherwise valid. (Confirmed by
+    // diffing a known-good TeconMoon inject: both in-disc signatures are zeroed.)
+    let mut tmd_off = [0u8; 4];
+    read_at(source.stream(), part_base + TMD_OFF_FIELD, &mut tmd_off)?;
+    let tmd_base = part_base + ((be32(&tmd_off) as u64) << 2);
+    header_patches.push((
+        part_base + TICKET_SIG.start as u64,
+        vec![0u8; TICKET_SIG.len()],
+    ));
+    header_patches.push((tmd_base + TMD_SIG.start as u64, vec![0u8; TMD_SIG.len()]));
+    header_patches.push((tmd_base + TMD_CONTENT0_HASH as u64, content_hash.to_vec()));
+
+    // Always (re)write the valid H3 table so we don't depend on the stream's copy.
+    header_patches.push((h3_base, h3_table));
+
+    // Sparse storage: only the hash groups the FST (and boot structures) actually use are written
+    // to the NFS; the multi-GB inter-file gaps are skipped without relocating any file.
+    let stored_data_groups = source.used_data_group_runs()?;
+
+    let partitions = vec![PartitionPlan {
+        start_sector: span.start_sector,
+        data_start_sector: span.data_start_sector,
+        data_end_sector: span.data_end_sector,
+        header_patches,
+        edits,
+        stored_data_groups,
+    }];
+    let disc_patches = partition_table_patches(part_base);
 
     if !applied.is_empty() {
         log::info!("applying main.dol patches: {}", applied.join(", "));
     }
     Ok(DiscPlan {
         partitions,
+        disc_patches,
         rvlt_content_hash,
         applied,
     })

@@ -153,13 +153,19 @@ pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
         nfs_stats.total_bytes
     );
 
-    // 4. Game ticket/TMD become rvlt.tik / rvlt.tmd. When the disc was patched, rvlt.tmd's
-    //    content hash must be updated to the rebuilt H3 table and re-fakesigned.
-    std::fs::write(staged.code_dir.join("rvlt.tik"), source.raw_ticket())
+    // 4. Game ticket/TMD become rvlt.tik / rvlt.tmd. Both are fakesigned (RSA signature zeroed):
+    //    fw.img's signature check is patched to accept a zeroed signature, and rejects the disc's
+    //    real signature — so an unmodified ticket/TMD boots the framework but hangs the emulator.
+    let mut rvlt_tik = source.raw_ticket().to_vec();
+    fakesign(&mut rvlt_tik);
+    std::fs::write(staged.code_dir.join("rvlt.tik"), &rvlt_tik)
         .map_err(|e| Error::io(staged.code_dir.join("rvlt.tik"), e))?;
     let mut rvlt_tmd = source.raw_tmd().to_vec();
     if let Some(content_hash) = plan.rvlt_content_hash {
+        // Also updates the content hash to the rebuilt H3 table, and zeroes the signature.
         update_rvlt_tmd(&mut rvlt_tmd, &content_hash);
+    } else {
+        fakesign(&mut rvlt_tmd);
     }
     std::fs::write(staged.code_dir.join("rvlt.tmd"), &rvlt_tmd)
         .map_err(|e| Error::io(staged.code_dir.join("rvlt.tmd"), e))?;
@@ -372,15 +378,25 @@ fn resolve_textures(config: &Config, platform: &str, game_id: &str, meta_dir: &P
     Ok(())
 }
 
-/// After a `main.dol` patch, point the Wii partition TMD's single content record at the rebuilt
-/// H3 table and fakesign it. The Wii TMD stores the content hash at `0x1F4` and its RSA-2048
-/// signature at `0x004..0x104`; zeroing the signature is accepted on signature-patched consoles
-/// (the same basis this tool already relies on for `title.tmd`/`title.tik`).
+/// The RSA-2048 signature region of a Wii ticket/TMD (`0x004..0x104`).
+const WII_SIG: std::ops::Range<usize> = 0x004..0x104;
+
+/// Fakesign a Wii ticket or TMD by zeroing its RSA signature. `fw.img`'s signature check is patched
+/// to accept a zeroed signature, so `rvlt.tik`/`rvlt.tmd` must be fakesigned this way (their
+/// original Nintendo signatures are rejected by the patched check and hang the emulator at boot).
+fn fakesign(data: &mut [u8]) {
+    if data.len() >= WII_SIG.end {
+        data[WII_SIG].fill(0);
+    }
+}
+
+/// After a `main.dol` patch or trim, point the Wii partition TMD's single content record at the
+/// rebuilt H3 table and fakesign it. The Wii TMD stores the content hash at `0x1F4` and its
+/// RSA-2048 signature at `0x004..0x104`.
 fn update_rvlt_tmd(tmd: &mut [u8], content_hash: &[u8; 20]) {
-    const SIG: std::ops::Range<usize> = 0x004..0x104;
     const CONTENT0_HASH: usize = 0x1F4;
     if tmd.len() >= CONTENT0_HASH + 20 {
-        tmd[SIG].fill(0);
+        tmd[WII_SIG].fill(0);
         tmd[CONTENT0_HASH..CONTENT0_HASH + 20].copy_from_slice(content_hash);
     }
 }

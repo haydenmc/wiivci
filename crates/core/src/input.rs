@@ -262,6 +262,95 @@ impl SourceDisc {
     pub fn stream(&mut self) -> &mut Disc {
         &mut self.disc
     }
+
+    /// Runs of 64-cluster hash groups (in the data partition) that hold real data — the boot
+    /// structures (boot.bin/bi2/apploader/main.dol/FST) plus every FST file — as
+    /// `(first_group, num_groups)`. Groups not covered are inter-file "gaps" the game never reads;
+    /// storing only these lets the NFS skip them (no compaction) — a Wii disc pads gaps with
+    /// non-zero garbage, so only the FST (not a zero-scan) can tell real data from padding.
+    pub fn used_data_group_runs(&self) -> Result<Vec<(u32, u32)>> {
+        const LOG_CLUSTER: u64 = 0x7C00; // logical (hash-stripped) bytes per cluster
+        const GROUP: u64 = 64; // clusters per hash group
+
+        let span = self.data_partition;
+        let total_sectors = (span.data_end_sector - span.data_start_sector) as u64;
+        let ngroups = total_sectors.div_ceil(GROUP) as usize;
+        let mut used = vec![false; ngroups];
+
+        let mut mark = |off: u64, len: u64| {
+            if len == 0 {
+                return;
+            }
+            let first = off / LOG_CLUSTER;
+            let last = (off + len - 1) / LOG_CLUSTER;
+            for c in first..=last {
+                let g = (c / GROUP) as usize;
+                if g < ngroups {
+                    used[g] = true;
+                }
+            }
+        };
+
+        let mut part = self.open_data_partition()?;
+        let ioerr = |e| Error::io("<partition>", e);
+
+        // boot.bin: main.dol and FST offsets (all logical, stored >> 2).
+        let mut boot = [0u8; 0x440];
+        part.seek(SeekFrom::Start(0)).map_err(ioerr)?;
+        part.read_exact(&mut boot).map_err(ioerr)?;
+        let dol_off = (be32(&boot[0x420..]) as u64) << 2;
+        let fst_off = (be32(&boot[0x424..]) as u64) << 2;
+        let fst_size = (be32(&boot[0x428..]) as u64) << 2;
+
+        // apploader (logical 0x2440): header 0x20, then image + trailer.
+        let mut ap = [0u8; 0x20];
+        part.seek(SeekFrom::Start(0x2440)).map_err(ioerr)?;
+        part.read_exact(&mut ap).map_err(ioerr)?;
+        let ap_end = 0x2440 + 0x20 + be32(&ap[0x14..]) as u64 + be32(&ap[0x18..]) as u64;
+
+        // main.dol size (18 sections, offsets at 0x00.., sizes at 0x90..).
+        let mut dolh = [0u8; 0x100];
+        part.seek(SeekFrom::Start(dol_off)).map_err(ioerr)?;
+        part.read_exact(&mut dolh).map_err(ioerr)?;
+        let mut dol_size = 0x100u64;
+        for i in 0..18 {
+            dol_size =
+                dol_size.max(be32(&dolh[i * 4..]) as u64 + be32(&dolh[0x90 + i * 4..]) as u64);
+        }
+
+        // Boot structures (regardless of on-disc order).
+        mark(0, ap_end); // boot.bin + bi2 + apploader
+        mark(dol_off, dol_size);
+        mark(fst_off, fst_size);
+
+        // Every file in the FST.
+        let meta = part.meta()?;
+        let fst = meta
+            .fst()
+            .map_err(|e| Error::UnsupportedDisc(format!("partition has no FST: {e}")))?;
+        for (_, node, _) in fst.iter() {
+            if node.is_dir() {
+                continue;
+            }
+            mark(node.offset(true), node.length());
+        }
+
+        // Coalesce marked groups into runs.
+        let mut runs = Vec::new();
+        let mut open: Option<(u32, u32)> = None;
+        for (g, &u) in used.iter().enumerate() {
+            match (&mut open, u) {
+                (Some((_, n)), true) => *n += 1,
+                (Some(_), false) => runs.push(open.take().unwrap()),
+                (None, true) => open = Some((g as u32, 1)),
+                (None, false) => {}
+            }
+        }
+        if let Some(r) = open {
+            runs.push(r);
+        }
+        Ok(runs)
+    }
 }
 
 impl DecryptedDisc for SourceDisc {
