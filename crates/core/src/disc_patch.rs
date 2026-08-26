@@ -68,6 +68,10 @@ pub struct PartitionPlan {
     /// `main.dol` edits, as (logical partition-data offset, replacement bytes). Data partition
     /// only; empty otherwise.
     pub edits: Vec<(u64, Vec<u8>)>,
+    /// Runs of 64-cluster hash groups (0-based within the data region) that hold real data and
+    /// must be stored; the rest are inter-file gaps skipped in the NFS (sparse storage, no
+    /// compaction). Empty means "store every group" (used by the synthetic GC disc).
+    pub stored_data_groups: Vec<(u32, u32)>,
 }
 
 /// A whole-disc rebuild plan: how to rebuild each partition's Wii hash tree (and apply any
@@ -140,8 +144,17 @@ fn read_at<R: Read + Seek>(disc: &mut R, offset: u64, out: &mut [u8]) -> Result<
 
 // Offsets within the partition header (at `start_sector * SECTOR`).
 const TMD_OFF_FIELD: u64 = 0x2A8; // u32, stored >> 2
-const TMD_SIG: std::ops::Range<usize> = 0x004..0x104; // RSA-2048 signature (zeroed to fakesign)
+const SIG: std::ops::Range<usize> = 0x004..0x104; // RSA-2048 signature (zeroed to fakesign)
 const TMD_CONTENT0_HASH: usize = 0x1F4; // Wii TMD single content hash
+
+// The partition's own ticket sits at the partition start (offset 0); its signature shares the
+// same 0x004..0x104 layout as the TMD's.
+const TICKET_SIG: std::ops::Range<usize> = SIG;
+const TMD_SIG: std::ops::Range<usize> = SIG;
+
+// Disc-level region info: the per-organisation age ratings (zeroed by the reference injectors).
+const REGION_AGE_RATINGS_OFF: u64 = 0x4E010;
+const REGION_AGE_RATINGS_LEN: usize = 0x10;
 
 /// Byte offsets of the disc partition table (a Wii inject keeps only the DATA partition).
 const PARTITION_GROUPS_OFF: u64 = 0x40000; // four 8-byte group entries
@@ -156,10 +169,16 @@ fn partition_table_patches(data_part_off: u64) -> Vec<(u64, Vec<u8>)> {
     let mut groups = vec![0u8; 0x20];
     groups[0..4].copy_from_slice(&1u32.to_be_bytes());
     groups[4..8].copy_from_slice(&((PARTITION_INFO_OFF >> 2) as u32).to_be_bytes());
-    // Info entry: { partition_offset >> 2, type = 0 (DATA) }.
-    let mut info = vec![0u8; 8];
+    // Info table: entry 0 = { partition_offset >> 2, type = 0 (DATA) }; the remaining three entry
+    // slots are cleared so a stale second entry from the source disc can't linger (the reference
+    // injectors leave only one entry). 0x20 bytes = four 8-byte entries.
+    let mut info = vec![0u8; 0x20];
     info[0..4].copy_from_slice(&((data_part_off >> 2) as u32).to_be_bytes());
-    vec![(PARTITION_GROUPS_OFF, groups), (PARTITION_INFO_OFF, info)]
+    vec![
+        (PARTITION_GROUPS_OFF, groups),
+        (PARTITION_INFO_OFF, info),
+        (REGION_AGE_RATINGS_OFF, vec![0u8; REGION_AGE_RATINGS_LEN]),
+    ]
 }
 
 /// Plan the disc rebuild (and any `main.dol` video patches).
@@ -184,8 +203,6 @@ pub fn plan_disc(source: &mut SourceDisc, patches: &VideoPatches) -> Result<Disc
             edits.push((dol.offset + e.offset as u64, e.bytes));
         }
     }
-
-    let mut rvlt_content_hash = None;
 
     let part_base = span.start_sector as u64 * SECTOR as u64;
     let mut off_field = [0u8; 4];
@@ -227,20 +244,34 @@ pub fn plan_disc(source: &mut SourceDisc, patches: &VideoPatches) -> Result<Disc
             let h3 = recompute_group(&mut clusters);
             h3_table[g as usize * 20..g as usize * 20 + 20].copy_from_slice(&h3);
         }
-
-        let content_hash = sha1(&h3_table);
-        rvlt_content_hash = Some(content_hash);
-
-        // Fix the embedded TMD (content hash + fakesign) to match the rebuilt H3 table.
-        let mut tmd_off = [0u8; 4];
-        read_at(source.stream(), part_base + TMD_OFF_FIELD, &mut tmd_off)?;
-        let tmd_base = part_base + ((be32(&tmd_off) as u64) << 2);
-        header_patches.push((tmd_base + TMD_SIG.start as u64, vec![0u8; TMD_SIG.len()]));
-        header_patches.push((tmd_base + TMD_CONTENT0_HASH as u64, content_hash.to_vec()));
     }
+
+    // The partition's content hash is SHA1 of the (possibly rebuilt) H3 table. This is unchanged
+    // from the source when there were no edits.
+    let content_hash = sha1(&h3_table);
+    let rvlt_content_hash = Some(content_hash);
+
+    // Fakesign the partition's OWN in-disc ticket and TMD (zero the RSA signatures) and set the
+    // TMD's content hash. The Wii U's patched fw.img accepts a zeroed signature and *rejects* a
+    // real one, so the partition must be fakesigned in place — not just the external rvlt.tik/tmd
+    // — or the emulator hangs at boot even though the disc is otherwise valid. (Confirmed by
+    // diffing a known-good TeconMoon inject: both in-disc signatures are zeroed.)
+    let mut tmd_off = [0u8; 4];
+    read_at(source.stream(), part_base + TMD_OFF_FIELD, &mut tmd_off)?;
+    let tmd_base = part_base + ((be32(&tmd_off) as u64) << 2);
+    header_patches.push((
+        part_base + TICKET_SIG.start as u64,
+        vec![0u8; TICKET_SIG.len()],
+    ));
+    header_patches.push((tmd_base + TMD_SIG.start as u64, vec![0u8; TMD_SIG.len()]));
+    header_patches.push((tmd_base + TMD_CONTENT0_HASH as u64, content_hash.to_vec()));
 
     // Always (re)write the valid H3 table so we don't depend on the stream's copy.
     header_patches.push((h3_base, h3_table));
+
+    // Sparse storage: only the hash groups the FST (and boot structures) actually use are written
+    // to the NFS; the multi-GB inter-file gaps are skipped without relocating any file.
+    let stored_data_groups = source.used_data_group_runs()?;
 
     let partitions = vec![PartitionPlan {
         start_sector: span.start_sector,
@@ -248,6 +279,7 @@ pub fn plan_disc(source: &mut SourceDisc, patches: &VideoPatches) -> Result<Disc
         data_end_sector: span.data_end_sector,
         header_patches,
         edits,
+        stored_data_groups,
     }];
     let disc_patches = partition_table_patches(part_base);
 

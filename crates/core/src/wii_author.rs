@@ -326,6 +326,8 @@ pub fn author_gc_disc(
             data_end_sector: span.data_end_sector,
             header_patches: Vec::new(),
             edits: Vec::new(),
+            // The synthetic GC disc is compact (Nintendont + game.iso, no gaps); store all groups.
+            stored_data_groups: Vec::new(),
         }],
         // The authored disc already has a single DATA partition and a matching table.
         disc_patches: Vec::new(),

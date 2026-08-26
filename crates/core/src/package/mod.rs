@@ -64,7 +64,7 @@ pub fn build_package(
     params: &PackageParams,
 ) -> Result<PackageStats> {
     fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
-    let plan = content::plan(build_dir)?;
+    let plan = content::plan(build_dir, params.title_id)?;
 
     let mut records = Vec::with_capacity(plan.contents.len());
     let mut total_content_bytes = 0u64;
