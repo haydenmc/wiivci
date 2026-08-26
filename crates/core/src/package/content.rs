@@ -89,12 +89,18 @@ fn is_hif(name: &str) -> bool {
 }
 
 /// Maximum decrypted bytes packed into a single game content before rolling over to a new one.
-/// The reference packers (NUSPacker/UWUVCI) group game data into ~3 GB contents rather than one
-/// content per file; the Wii U installer hangs part-way through installing a package that splits
-/// the game across many small contents (confirmed: the same game data installs as one content but
-/// hangs when split per-`hif`). 3 GB keeps the encrypted `.app` (~1.6% larger) under the FAT32 4 GB
-/// file limit. NOT a hash-group boundary — game contents may hold many `hif_*.nfs` files.
-const MAX_GAME_CONTENT_BYTES: u64 = 0xC000_0000; // 3 GiB
+/// The reference packers (NUSPacker/UWUVCI) group game data into large contents rather than one
+/// content per file; the Wii U installer hangs installing a package that splits the game across
+/// many small contents (confirmed: the same game data installs as one content but hangs when split
+/// per-`hif`).
+///
+/// The cap must keep each encrypted `.app` (~1.6% larger than the decrypted data here) **under 2
+/// GiB** (`INT32_MAX`): a content ≥2 GiB hangs the installer immediately (a size field is handled
+/// as signed 32-bit somewhere in the install path — matching NUSPacker's historical 2 GiB limit,
+/// and confirmed on hardware where 2.98 GiB game contents hung at install while ≤1.2 GiB ones
+/// installed). 1.75 GiB decrypted → ~1.74 GiB `.app`, a comfortable margin. NOT a hash-group
+/// boundary — game contents may hold many `hif_*.nfs` files.
+const MAX_GAME_CONTENT_BYTES: u64 = 0x7000_0000; // 1.75 GiB (keeps the .app under 2 GiB)
 
 /// Rolling state for packing `hif_*.nfs` game files into a few large contents.
 struct GameGrouping {
