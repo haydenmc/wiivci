@@ -43,6 +43,13 @@ const H2_REGION: usize = 8 * 20; // 0xA0
 /// Offset of the `h3_table_off` u32 (stored `>> 2`) within the partition header.
 const H3_TABLE_OFF_FIELD: u64 = 0x2B4;
 
+/// Size of a Wii partition's H3 table. The table is a fixed-size array of 20-byte group hashes.
+pub const H3_TABLE_SIZE: usize = 0x18000;
+
+/// Number of 64-cluster hash groups an H3 table can describe (`0x18000 / 20`, the last 16 bytes
+/// of the table are unused padding). A partition may not hold more data groups than this.
+pub const MAX_H3_GROUPS: usize = H3_TABLE_SIZE / 20; // 4915
+
 fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
@@ -51,8 +58,8 @@ fn sha1(buf: &[u8]) -> [u8; 20] {
     Sha1::digest(buf).into()
 }
 
-/// The result of patching the disc: full replacement clusters/sectors (keyed by disc sector,
-/// Per-partition plan consumed by [`crate::nfs::build_nfs`].
+/// Per-partition plan consumed by [`crate::nfs::build_nfs`]: which sectors the partition spans,
+/// which header bytes to overlay, which `main.dol` edits to apply, and which hash groups to store.
 #[derive(Clone)]
 pub struct PartitionPlan {
     /// First sector of the partition on the logical disc.
@@ -83,7 +90,9 @@ pub struct DiscPlan {
     /// Byte-range overlays applied to the disc-level (non-partition) sectors — used to rewrite the
     /// partition table so it lists only the data partition. Keyed by absolute disc byte offset.
     pub disc_patches: Vec<(u64, Vec<u8>)>,
-    /// New content hash for the emitted `rvlt.tmd`, set only when the data partition was patched.
+    /// Content hash for the emitted `rvlt.tmd`: SHA-1 of the data partition's H3 table. Always
+    /// set by [`plan_disc`] and [`crate::wii_author::author_gc_disc`]; when no `main.dol` edit was
+    /// applied it simply equals the hash of the source disc's own H3 table.
     pub rvlt_content_hash: Option<[u8; 20]>,
     /// Names of the video patches that matched and were applied.
     pub applied: Vec<&'static str>,
@@ -93,9 +102,14 @@ pub struct DiscPlan {
 ///
 /// `clusters` must be exactly [`SECTORS_PER_GROUP`] clusters of [`SECTOR`] bytes; clusters that
 /// fall past the partition end should be passed zero-filled (matching `nod`'s zero-sector
-/// padding).
-pub fn recompute_group(clusters: &mut [[u8; SECTOR]]) -> [u8; 20] {
-    assert_eq!(clusters.len(), SECTORS_PER_GROUP);
+/// padding). A differently sized slice is a caller bug and returns an error.
+pub fn recompute_group(clusters: &mut [[u8; SECTOR]]) -> Result<[u8; 20]> {
+    if clusters.len() != SECTORS_PER_GROUP {
+        return Err(Error::Other(anyhow::anyhow!(
+            "hash group must be exactly {SECTORS_PER_GROUP} clusters, got {}",
+            clusters.len()
+        )));
+    }
 
     // H0: hash each 0x400 data sub-block into the cluster's H0 region.
     for cluster in clusters.iter_mut() {
@@ -132,7 +146,22 @@ pub fn recompute_group(clusters: &mut [[u8; SECTOR]]) -> [u8; 20] {
     }
 
     // H3: hash the group's H2 region.
-    sha1(&clusters[0][H2_OFF..H2_OFF + H2_REGION])
+    Ok(sha1(&clusters[0][H2_OFF..H2_OFF + H2_REGION]))
+}
+
+/// The 20-byte H3 entry of hash group `g` within an H3 table, as a mutable slice.
+///
+/// Returns an error instead of panicking when `g` is past what the fixed-size table can describe
+/// (i.e. the partition holds more than [`MAX_H3_GROUPS`] groups — a disc larger than the Wii hash
+/// tree can cover).
+pub(crate) fn h3_entry_mut(h3_table: &mut [u8], g: usize) -> Result<&mut [u8]> {
+    let table_len = h3_table.len();
+    h3_table.get_mut(g * 20..g * 20 + 20).ok_or_else(|| {
+        Error::FormatLimit(format!(
+            "hash group {g} is past the partition's H3 table ({table_len}-byte table holds at \
+             most {MAX_H3_GROUPS} groups); the disc is too large for the Wii hash tree"
+        ))
+    })
 }
 
 fn read_at<R: Read + Seek>(disc: &mut R, offset: u64, out: &mut [u8]) -> Result<()> {
@@ -246,8 +275,8 @@ pub fn plan_disc(
                 }
             }
             apply_edits_to_group(&mut clusters, g, &edits);
-            let h3 = recompute_group(&mut clusters);
-            h3_table[g as usize * 20..g as usize * 20 + 20].copy_from_slice(&h3);
+            let h3 = recompute_group(&mut clusters)?;
+            h3_entry_mut(&mut h3_table, g as usize)?.copy_from_slice(&h3);
         }
     }
 
@@ -366,14 +395,14 @@ mod tests {
     #[test]
     fn recompute_produces_self_consistent_tree() {
         let mut clusters = sample_group();
-        let h3 = recompute_group(&mut clusters);
+        let h3 = recompute_group(&mut clusters).unwrap();
         verify_group(&clusters, &h3);
     }
 
     #[test]
     fn h1_and_h2_tables_are_replicated_across_the_subgroup_and_group() {
         let mut clusters = sample_group();
-        recompute_group(&mut clusters);
+        recompute_group(&mut clusters).unwrap();
         // H1 table identical within each subgroup.
         for sg in 0..8 {
             let first = clusters[sg * 8][H1_OFF..H1_OFF + H1_REGION].to_vec();
@@ -392,12 +421,28 @@ mod tests {
     }
 
     #[test]
+    fn wrong_sized_group_is_an_error_not_a_panic() {
+        let mut short = vec![[0u8; SECTOR]; SECTORS_PER_GROUP - 1];
+        assert!(recompute_group(&mut short).is_err());
+    }
+
+    #[test]
+    fn h3_entry_lookup_is_bounds_checked() {
+        let mut table = vec![0u8; H3_TABLE_SIZE];
+        assert!(h3_entry_mut(&mut table, MAX_H3_GROUPS - 1).is_ok());
+        // One past capacity (and anything beyond) errors rather than panicking.
+        let err = h3_entry_mut(&mut table, MAX_H3_GROUPS).unwrap_err();
+        assert!(matches!(err, Error::FormatLimit(_)), "got {err}");
+        assert!(h3_entry_mut(&mut table, MAX_H3_GROUPS + 1000).is_err());
+    }
+
+    #[test]
     fn a_single_data_byte_change_propagates_to_h3() {
         let mut a = sample_group();
-        let h3a = recompute_group(&mut a);
+        let h3a = recompute_group(&mut a).unwrap();
         let mut b = sample_group();
         b[20][HASH_BLOCK + 1234] ^= 0xFF; // flip a byte in cluster 20's data
-        let h3b = recompute_group(&mut b);
+        let h3b = recompute_group(&mut b).unwrap();
         assert_ne!(h3a, h3b, "changing data must change the group's H3");
         verify_group(&b, &h3b);
     }

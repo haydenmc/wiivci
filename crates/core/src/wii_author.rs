@@ -33,7 +33,9 @@ use std::path::Path;
 
 use sha1::{Digest, Sha1};
 
-use crate::disc_patch::{recompute_group, DiscPlan, PartitionPlan};
+use crate::disc_patch::{
+    h3_entry_mut, recompute_group, DiscPlan, PartitionPlan, H3_TABLE_SIZE, MAX_H3_GROUPS,
+};
 use crate::error::{Error, Result};
 use crate::input::{DecryptedDisc, PartitionSpan, ReadSeek, DISC_SECTOR_SIZE};
 
@@ -41,7 +43,16 @@ const SECTOR: u64 = DISC_SECTOR_SIZE as u64; // 0x8000
 const HASH_BLOCK: usize = 0x400;
 const CLUSTER_DATA: usize = DISC_SECTOR_SIZE - HASH_BLOCK; // 0x7C00
 const SECTORS_PER_GROUP: usize = 64;
-const H3_TABLE_SIZE: usize = 0x18000;
+
+/// Logical (hash-stripped) bytes one 64-cluster hash group carries.
+const GROUP_LOGICAL_SIZE: u64 = SECTORS_PER_GROUP as u64 * CLUSTER_DATA as u64; // 0x1F0000
+
+/// Largest logical partition-data size the fixed-size H3 table can describe
+/// (`MAX_H3_GROUPS` × 0x1F0000 ≈ 9.3 GiB).
+const MAX_LOGICAL_SIZE: u64 = MAX_H3_GROUPS as u64 * GROUP_LOGICAL_SIZE;
+
+/// Largest `game.iso` we can record: the disc FST stores a file's size in a u32.
+const MAX_ISO_SIZE: u64 = u32::MAX as u64;
 
 // Absolute disc offsets.
 const PART_ABS: u64 = 0x50000;
@@ -85,6 +96,48 @@ fn put_u32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
 }
 
+/// Narrow a byte offset/size to the u32 the disc format stores it in, erroring instead of
+/// truncating.
+///
+/// Invariant: every call site here is downstream of [`author_gc_disc`]'s size validation
+/// (`MAX_ISO_SIZE` / `MAX_LOGICAL_SIZE`), so none of these can actually fail — the check exists so
+/// a future layout change can't silently wrap a >4 GiB value.
+fn u32_field(what: &str, v: u64) -> Result<u32> {
+    u32::try_from(v).map_err(|_| {
+        Error::FormatLimit(format!(
+            "{what} ({v} bytes) does not fit the disc's 32-bit field"
+        ))
+    })
+}
+
+/// The Wii disc **region-info** value (disc offset [`REGION_INFO_ABS`] = 0x4E000) for a game-id
+/// region character (`game_id[3]`): `0` = NTSC-J, `1` = NTSC-U, `2` = PAL, `4` = NTSC-K (Korea).
+///
+/// The letter → region mapping is the standard one used by `wit` (Wiimm's ISO Tools, region table
+/// in `lib-std.c`) and Dolphin (`DiscIO::RegionSwitchWii`). Unrecognised letters keep the historic
+/// behaviour of this authoring path (NTSC-J) and log a warning.
+fn region_info_for(region_char: u8) -> u32 {
+    match region_char {
+        // Japan / Taiwan-China (W) — NTSC-J.
+        b'J' | b'W' => 0,
+        // Americas — NTSC-U ('N' = Japan title released in the USA).
+        b'E' | b'N' => 1,
+        // Europe/Australia and the per-language PAL codes ('L'/'M' = J/U title released in PAL,
+        // 'U' = NTSC title released in PAL).
+        b'D' | b'F' | b'I' | b'L' | b'M' | b'P' | b'R' | b'S' | b'U' | b'V' | b'X' | b'Y'
+        | b'Z' => 2,
+        // Korea (Q = Korean release with Japanese audio, T = with English audio).
+        b'K' | b'Q' | b'T' => 4,
+        other => {
+            log::warn!(
+                "unknown region character '{}' in game id; defaulting the disc region to NTSC-J",
+                other as char
+            );
+            0
+        }
+    }
+}
+
 /// A synthetic Wii disc authored on disk, ready to feed to [`crate::nfs::build_nfs`].
 pub struct AuthoredDisc {
     file: File,
@@ -118,7 +171,9 @@ impl DecryptedDisc for AuthoredDisc {
 /// GameCube/Wii disc FST entries are 12 bytes: `[type:u8][name_off:u24][arg0:u32][arg1:u32]`.
 /// The root directory (entry 0) stores the total entry count in `arg1`. The `game.iso` file's
 /// data offset is stored `>> 2` (Wii shifts disc offsets).
-fn build_fst(iso_data_off: u64, iso_size: u64) -> Vec<u8> {
+fn build_fst(iso_data_off: u64, iso_size: u64) -> Result<Vec<u8>> {
+    let off_field = u32_field("game.iso offset", iso_data_off >> 2)?;
+    let size_field = u32_field("game.iso size", iso_size)?;
     let mut v = Vec::new();
     // Root directory: type=1, name_off=0, parent=0, arg1 = total entry count (2).
     v.push(1);
@@ -128,14 +183,14 @@ fn build_fst(iso_data_off: u64, iso_size: u64) -> Vec<u8> {
     // game.iso: type=0 (file), name_off=0, data_off>>2, size.
     v.push(0);
     v.extend_from_slice(&[0, 0, 0]);
-    v.extend_from_slice(&((iso_data_off >> 2) as u32).to_be_bytes());
-    v.extend_from_slice(&(iso_size as u32).to_be_bytes());
+    v.extend_from_slice(&off_field.to_be_bytes());
+    v.extend_from_slice(&size_field.to_be_bytes());
     // String table: names in entry order.
     v.extend_from_slice(b"game.iso\0");
     while v.len() % 4 != 0 {
         v.push(0);
     }
-    v
+    Ok(v)
 }
 
 /// Assemble the fixed "system" portion of the logical partition data
@@ -147,7 +202,7 @@ fn build_sys_blob(
     apploader: &[u8],
     main_dol: &[u8],
     iso_size: u64,
-) -> (Vec<u8>, u64) {
+) -> Result<(Vec<u8>, u64)> {
     // boot.bin + bi2.bin (bi2 is all zero for our purposes).
     let mut sys = vec![0u8; APPLOADER_OFF];
     sys[0..6].copy_from_slice(game_id);
@@ -167,19 +222,22 @@ fn build_sys_blob(
     // serialize the FST (which needs that offset).
     let fst_len = align_up(2 * 12 + b"game.iso\0".len(), 4);
     let iso_off = align_up(fst_off + fst_len, ALIGN);
-    let fst = build_fst(iso_off as u64, iso_size);
+    let fst = build_fst(iso_off as u64, iso_size)?;
     debug_assert_eq!(fst.len(), fst_len);
     sys.extend_from_slice(&fst);
     pad_to(&mut sys, iso_off);
 
-    // Fill boot.bin's offset table now that the layout is known.
-    put_u32(&mut sys, BOOT_DOL_OFF_FIELD, (dol_off >> 2) as u32);
-    put_u32(&mut sys, BOOT_FST_OFF_FIELD, (fst_off >> 2) as u32);
-    put_u32(&mut sys, BOOT_FST_SIZE_FIELD, (fst_len >> 2) as u32);
-    put_u32(&mut sys, BOOT_FST_MAX_FIELD, (fst_len >> 2) as u32);
+    // Fill boot.bin's offset table now that the layout is known (all `>> 2` u32 fields).
+    let dol_field = u32_field("main.dol offset", dol_off as u64 >> 2)?;
+    let fst_off_field = u32_field("FST offset", fst_off as u64 >> 2)?;
+    let fst_len_field = u32_field("FST size", fst_len as u64 >> 2)?;
+    put_u32(&mut sys, BOOT_DOL_OFF_FIELD, dol_field);
+    put_u32(&mut sys, BOOT_FST_OFF_FIELD, fst_off_field);
+    put_u32(&mut sys, BOOT_FST_SIZE_FIELD, fst_len_field);
+    put_u32(&mut sys, BOOT_FST_MAX_FIELD, fst_len_field);
 
     debug_assert_eq!(BOOT_BIN_LEN + BI2_LEN, APPLOADER_OFF);
-    (sys, iso_off as u64)
+    Ok((sys, iso_off as u64))
 }
 
 fn pad_to(v: &mut Vec<u8>, len: usize) {
@@ -242,6 +300,11 @@ pub struct GcDiscInputs<'a> {
 
 /// Author a synthetic Wii disc booting Nintendont, with `iso` (`iso_size` bytes) embedded as
 /// `game.iso`. The disc is written to `out_path`; the returned [`AuthoredDisc`] borrows that file.
+///
+/// The image is size-checked up front against what the synthetic disc layout can express — the
+/// FST's u32 file-size field (`MAX_ISO_SIZE`) and the H3 table's group capacity
+/// (`MAX_LOGICAL_SIZE`) — so nothing downstream has to truncate an offset or index past the
+/// table. Real GameCube images (≤ ~1.5 GiB single-layer, ~3 GiB dual-layer) are far below both.
 pub fn author_gc_disc(
     iso: &mut dyn ReadSeek,
     iso_size: u64,
@@ -257,10 +320,24 @@ pub fn author_gc_disc(
     } = *inputs;
     let ioerr = |e| Error::io(out_path, e);
 
-    let (sys_blob, iso_off) = build_sys_blob(&game_id, disc_title, apploader, main_dol, iso_size);
+    if iso_size > MAX_ISO_SIZE {
+        return Err(Error::FormatLimit(format!(
+            "game image is {iso_size} bytes; the disc FST records a file size in a u32 \
+             (max {MAX_ISO_SIZE} bytes)"
+        )));
+    }
+
+    let (sys_blob, iso_off) = build_sys_blob(&game_id, disc_title, apploader, main_dol, iso_size)?;
     let logical_size = iso_off + iso_size;
+    if logical_size > MAX_LOGICAL_SIZE {
+        return Err(Error::FormatLimit(format!(
+            "synthetic disc would hold {logical_size} logical bytes; a Wii partition's H3 table \
+             covers at most {MAX_H3_GROUPS} hash groups ({MAX_LOGICAL_SIZE} bytes)"
+        )));
+    }
     let total_clusters = logical_size.div_ceil(CLUSTER_DATA as u64) as usize;
     let num_groups = total_clusters.div_ceil(SECTORS_PER_GROUP);
+    debug_assert!(num_groups <= MAX_H3_GROUPS);
     let data_size = total_clusters as u64 * SECTOR;
 
     let mut file = OpenOptions::new()
@@ -292,8 +369,8 @@ pub fn author_gc_disc(
                 )?;
             }
         }
-        let h3 = recompute_group(&mut group);
-        h3_table[g * 20..g * 20 + 20].copy_from_slice(&h3);
+        let h3 = recompute_group(&mut group)?;
+        h3_entry_mut(&mut h3_table, g)?.copy_from_slice(&h3);
         for (k, cluster) in group.iter().enumerate() {
             if g * SECTORS_PER_GROUP + k < total_clusters {
                 file.write_all(cluster).map_err(ioerr)?;
@@ -307,7 +384,7 @@ pub fn author_gc_disc(
 
     // Now build and write the 0x70000-byte prefix (disc header, partition table, partition
     // header) with the computed H3 table and TMD.
-    let prefix = build_prefix(&game_id, disc_title, &ticket, &tmd, &h3_table, data_size);
+    let prefix = build_prefix(&game_id, disc_title, &ticket, &tmd, &h3_table, data_size)?;
     file.seek(SeekFrom::Start(0)).map_err(ioerr)?;
     file.write_all(&prefix).map_err(ioerr)?;
     file.flush().map_err(ioerr)?;
@@ -396,7 +473,7 @@ fn build_prefix(
     tmd: &[u8],
     h3_table: &[u8],
     data_size: u64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut p = vec![0u8; DATA_ABS as usize];
 
     // Disc header.
@@ -411,8 +488,13 @@ fn build_prefix(
     put_u32(&mut p, pt + 0x20, (PART_ABS >> 2) as u32); // partition offset
     put_u32(&mut p, pt + 0x24, 0); // type 0 = DATA
 
-    // Region info (region code left 0).
-    put_u32(&mut p, REGION_INFO_ABS as usize, 0);
+    // Region info, derived from the game id's region character so a non-Japanese game doesn't
+    // present itself as NTSC-J (see `region_info_for`).
+    put_u32(
+        &mut p,
+        REGION_INFO_ABS as usize,
+        region_info_for(game_id[3]),
+    );
 
     // Partition header.
     let ph = PART_ABS as usize;
@@ -423,19 +505,120 @@ fn build_prefix(
     put_u32(&mut p, ph + 0x2B0, 0); // cert_chain_offset
     put_u32(&mut p, ph + 0x2B4, (H3_PART_OFF >> 2) as u32); // h3_table_offset >> 2
     put_u32(&mut p, ph + 0x2B8, (DATA_PART_OFF >> 2) as u32); // data_offset >> 2
-    put_u32(&mut p, ph + 0x2BC, (data_size >> 2) as u32); // data_size >> 2
+    put_u32(
+        &mut p,
+        ph + 0x2BC,
+        u32_field("partition data size", data_size >> 2)?,
+    ); // data_size >> 2
     let tmd_abs = ph + TMD_PART_OFF as usize;
     p[tmd_abs..tmd_abs + tmd.len()].copy_from_slice(tmd);
     let h3_abs = ph + H3_PART_OFF as usize;
     p[h3_abs..h3_abs + h3_table.len()].copy_from_slice(h3_table);
 
-    p
+    Ok(p)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Build a disc prefix whose game id carries `region` as its 4th byte, with everything else
+    /// held fixed.
+    fn prefix_for(region: u8) -> Vec<u8> {
+        let mut game_id = *b"GM2E8P";
+        game_id[3] = region;
+        let ticket = build_wii_ticket(0x0005_0000_1234_5678);
+        let tmd = build_wii_tmd(0x0005_0000_1234_5678, 64 * SECTOR, &[0x11; 20]);
+        let h3 = vec![0u8; H3_TABLE_SIZE];
+        build_prefix(&game_id, "GC Test", &ticket, &tmd, &h3, 64 * SECTOR).unwrap()
+    }
+
+    /// The disc region-info field must follow the source game's region character — and nothing
+    /// *else* in the prefix may depend on it.
+    ///
+    /// Byte-pin: for an NTSC-J id the field stays all-zero, exactly as this authoring path always
+    /// wrote it, so NTSC-J GameCube output is unchanged.
+    #[test]
+    fn region_info_follows_the_game_id_region_char() {
+        let r = REGION_INFO_ABS as usize;
+        let j = prefix_for(b'J');
+        assert_eq!(&j[r..r + 4], &[0, 0, 0, 0], "NTSC-J region field must be 0");
+
+        for (region, want) in [
+            (b'W', 0u32),
+            (b'E', 1),
+            (b'N', 1),
+            (b'P', 2),
+            (b'D', 2),
+            (b'S', 2),
+            (b'Z', 2),
+            (b'K', 4),
+            (b'Q', 4),
+            (b'T', 4),
+            (b'?', 0), // unknown letters fall back to NTSC-J
+        ] {
+            let p = prefix_for(region);
+            assert_eq!(
+                u32::from_be_bytes(p[r..r + 4].try_into().unwrap()),
+                want,
+                "region '{}' must map to {want}",
+                region as char
+            );
+
+            // Only the game id's region byte and the 4-byte region-info field may differ from the
+            // NTSC-J prefix.
+            let mut normalized = p.clone();
+            normalized[3] = b'J';
+            normalized[r..r + 4].copy_from_slice(&j[r..r + 4]);
+            assert_eq!(
+                normalized, j,
+                "region '{}' changed prefix bytes outside the region-info field",
+                region as char
+            );
+        }
+    }
+
+    /// A game image too large for the FST's u32 size field must be rejected with an error (and no
+    /// output file written) rather than silently truncating or panicking.
+    #[test]
+    fn oversized_game_image_errors_instead_of_truncating() {
+        let out = tempfile::tempdir().unwrap();
+        let disc_path = out.path().join("gc_disc.img");
+        let mut cur = Cursor::new(Vec::new());
+        let result = author_gc_disc(
+            &mut cur,
+            MAX_ISO_SIZE + 1,
+            &GcDiscInputs {
+                game_id: *b"GM2E8P",
+                disc_title: "GC Test",
+                main_dol: &[0u8; 32],
+                apploader: &[],
+                title_id: 0x0005_0000_1234_5678,
+            },
+            &disc_path,
+        );
+        let Err(err) = result else {
+            panic!("an oversized game image must be rejected");
+        };
+        assert!(
+            matches!(err, Error::FormatLimit(_)),
+            "expected a format-limit error, got {err}"
+        );
+        assert!(
+            !disc_path.exists(),
+            "no disc should be written on rejection"
+        );
+    }
+
+    /// The size validation is what keeps the H3 table in range: the largest accepted image still
+    /// needs no more than `MAX_H3_GROUPS` hash groups.
+    #[test]
+    fn accepted_image_sizes_fit_the_h3_table() {
+        const { assert!(MAX_ISO_SIZE < MAX_LOGICAL_SIZE) };
+        let clusters = MAX_LOGICAL_SIZE.div_ceil(CLUSTER_DATA as u64) as usize;
+        assert_eq!(clusters.div_ceil(SECTORS_PER_GROUP), MAX_H3_GROUPS);
+    }
 
     /// Author a tiny synthetic disc (a few-cluster fake game.iso), pack it to NFS, reopen with
     /// `nod`'s hash **validation** on, and confirm: the partition traverses without a hash error,
