@@ -118,11 +118,28 @@ impl GameGrouping {
         }
     }
 
-    /// Return the content index a game file of `size` bytes should join, creating a new content
-    /// when the current one is full (or none exists yet).
-    fn content_for(&mut self, size: u64, contents: &mut Vec<PlannedContent>) -> u16 {
+    /// Return the content index a game file at `path` of `size` bytes should join, creating a new
+    /// content when the current one is full (or none exists yet).
+    ///
+    /// Errors if the file alone exceeds [`MAX_GAME_CONTENT_BYTES`] — packing it in regardless would
+    /// silently recreate the ≥2 GiB content that the cap exists to prevent (see the installer-hang
+    /// rationale on the constant).
+    fn content_for(
+        &mut self,
+        path: &Path,
+        size: u64,
+        contents: &mut Vec<PlannedContent>,
+    ) -> Result<u16> {
         let placed = align_up(size, OFFSET_FACTOR as u64);
-        match self.current {
+        if placed > MAX_GAME_CONTENT_BYTES {
+            return Err(Error::FormatLimit(format!(
+                "{} is {size} bytes, which alone exceeds the {MAX_GAME_CONTENT_BYTES}-byte game \
+                 content cap; a content at/above 2 GiB is known to hang the Wii U installer, so \
+                 this file cannot be packaged as-is",
+                path.display()
+            )));
+        }
+        Ok(match self.current {
             Some(idx) if self.current_size + placed <= MAX_GAME_CONTENT_BYTES => {
                 self.current_size += placed;
                 idx
@@ -140,7 +157,7 @@ impl GameGrouping {
                 self.current_size = placed;
                 idx
             }
-        }
+        })
     }
 }
 
@@ -149,8 +166,14 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
         .map_err(|e| Error::io(dir, e))?
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| Error::io(dir, e))?;
-    // Case-insensitive by name, matching retail FST ordering.
-    entries.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
+    // Case-insensitive by name, matching retail FST ordering. Names differing only by case compare
+    // equal under `to_lowercase()`, so tiebreak on the exact bytes too — otherwise two such entries
+    // would fall back to readdir order, which is filesystem-dependent and would break byte-identity
+    // of the output across machines/filesystems.
+    entries.sort_by_key(|e| {
+        let n = e.file_name().to_string_lossy().into_owned();
+        (n.to_lowercase(), n)
+    });
     Ok(entries)
 }
 
@@ -160,9 +183,11 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
 /// shader assets, or the emulator hangs at boot. No effect on `code/`/`meta/` (no hif files).
 fn read_dir_hif_first(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
     let mut entries = read_dir_sorted(dir)?;
+    // Same case-insensitive-with-exact-tiebreak rationale as `read_dir_sorted` above.
     entries.sort_by_key(|e| {
-        let n = e.file_name().to_string_lossy().to_lowercase();
-        (!is_hif(&n), n) // hif files first, then everything else in name order
+        let n = e.file_name().to_string_lossy().into_owned();
+        let lower = n.to_lowercase();
+        (!is_hif(&lower), lower, n) // hif files first, then everything else in name order
     });
     Ok(entries)
 }
@@ -272,10 +297,13 @@ pub fn plan(build_dir: &Path, title_id: u64) -> Result<PackagePlan> {
                 p.is_file() && !cluster_of.contains_key(p) // app.xml/cos.xml already assigned
             })
             .collect();
+        // Same case-insensitive-with-exact-tiebreak rationale as read_dir_sorted above: names
+        // differing only by case must not fall back to filesystem-dependent readdir order.
         rest.sort_by_key(|p| {
-            let n = p.file_name().unwrap().to_string_lossy().to_lowercase();
-            let exec = n.ends_with(".rpx") || n.ends_with(".rpl");
-            (!exec, n)
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            let lower = n.to_lowercase();
+            let exec = lower.ends_with(".rpx") || lower.ends_with(".rpl");
+            (!exec, lower, n)
         });
         for p in rest {
             let idx = alloc(TYPE_NONHASHED, false, &mut contents);
@@ -288,7 +316,7 @@ pub fn plan(build_dir: &Path, title_id: u64) -> Result<PackagePlan> {
     if content_dir.is_dir() {
         let mut game = GameGrouping::new();
         for (path, size) in collect_files(&content_dir)? {
-            let idx = game.content_for(size, &mut contents);
+            let idx = game.content_for(&path, size, &mut contents)?;
             cluster_of.insert(path, idx);
         }
     }
@@ -588,5 +616,115 @@ mod tests {
             "each code file gets its own content"
         );
         assert_ne!(app.cluster, rpx.cluster);
+    }
+
+    #[test]
+    fn game_grouping_packs_up_to_the_cap_in_one_content() {
+        let mut game = GameGrouping::new();
+        let mut contents: Vec<PlannedContent> = Vec::new();
+        // Both sizes are already OFFSET_FACTOR-aligned, so their sum lands exactly on the cap.
+        let a = MAX_GAME_CONTENT_BYTES - OFFSET_FACTOR as u64;
+        let b = OFFSET_FACTOR as u64;
+        let idx_a = game
+            .content_for(Path::new("a.bin"), a, &mut contents)
+            .unwrap();
+        let idx_b = game
+            .content_for(Path::new("b.bin"), b, &mut contents)
+            .unwrap();
+        assert_eq!(
+            idx_a, idx_b,
+            "sum equal to the cap must stay in one content"
+        );
+        assert_eq!(contents.len(), 1);
+    }
+
+    #[test]
+    fn game_grouping_splits_at_the_file_boundary_once_over_the_cap() {
+        let mut game = GameGrouping::new();
+        let mut contents: Vec<PlannedContent> = Vec::new();
+        let a = MAX_GAME_CONTENT_BYTES - OFFSET_FACTOR as u64;
+        // The smallest possible excess given OFFSET_FACTOR alignment granularity.
+        let b = 2 * OFFSET_FACTOR as u64;
+        let idx_a = game
+            .content_for(Path::new("a.bin"), a, &mut contents)
+            .unwrap();
+        let idx_b = game
+            .content_for(Path::new("b.bin"), b, &mut contents)
+            .unwrap();
+        assert_ne!(
+            idx_a, idx_b,
+            "a file that would push the running total past the cap rolls over to a new content"
+        );
+        assert_eq!(contents.len(), 2);
+    }
+
+    #[test]
+    fn game_grouping_errors_when_a_single_file_exceeds_the_cap() {
+        let mut game = GameGrouping::new();
+        let mut contents: Vec<PlannedContent> = Vec::new();
+        let path = Path::new("huge_hif_000000.nfs");
+        let err = game
+            .content_for(path, MAX_GAME_CONTENT_BYTES + 1, &mut contents)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("huge_hif_000000.nfs"),
+            "error should name the offending file: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_dir_sorted_orders_case_only_duplicates_deterministically() {
+        // Names differing only by case must sort deterministically (case-insensitive primary key,
+        // exact-bytes tiebreak) regardless of creation/readdir order, which is filesystem-dependent
+        // and would otherwise break byte-identity of the output across machines/filesystems.
+        let dir_a = tempfile::tempdir().unwrap();
+        std::fs::write(dir_a.path().join("Foo.txt"), b"a").unwrap();
+        std::fs::write(dir_a.path().join("foo.txt"), b"b").unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(dir_b.path().join("foo.txt"), b"b").unwrap();
+        std::fs::write(dir_b.path().join("Foo.txt"), b"a").unwrap();
+
+        fn names(dir: &Path) -> Vec<String> {
+            read_dir_sorted(dir)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        }
+
+        let expected = vec!["Foo.txt".to_string(), "foo.txt".to_string()];
+        assert_eq!(
+            names(dir_a.path()),
+            expected,
+            "insertion order: Foo.txt then foo.txt"
+        );
+        assert_eq!(
+            names(dir_b.path()),
+            expected,
+            "insertion order: foo.txt then Foo.txt"
+        );
+    }
+
+    #[test]
+    fn code_files_with_case_only_duplicate_names_order_deterministically() {
+        // Same bug class as read_dir_sorted, in plan()'s separate rpx/rpl-first sort for the
+        // remaining code/ files: case-only duplicates must break ties on exact bytes, not fall
+        // back to filesystem-dependent readdir order.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("code")).unwrap();
+        std::fs::write(root.join("code/Foo.rpl"), vec![0u8; 10]).unwrap();
+        std::fs::write(root.join("code/foo.rpl"), vec![1u8; 10]).unwrap();
+
+        let plan = plan(root, 0x00050002_534b4a45).unwrap();
+        let parsed = Fst::parse(&plan.fst).unwrap();
+        let foo_upper = parsed.nodes.iter().find(|n| n.name == "Foo.rpl").unwrap();
+        let foo_lower = parsed.nodes.iter().find(|n| n.name == "foo.rpl").unwrap();
+        assert!(
+            foo_upper.cluster < foo_lower.cluster,
+            "Foo.rpl sorts before foo.rpl by exact-bytes tiebreak, so it gets the earlier content"
+        );
     }
 }
