@@ -45,6 +45,14 @@ Useful options: `--icon/--boot-tv/--boot-drc <png>` to supply artwork, `--region
 intermediate build tree). If no GamePad boot image is found (community art repos usually only
 carry the TV image), the TV image is reused for the GamePad splash so both screens match.
 
+Disc storage: the data partition is stored sparsely, skipping the multi-GB inter-file gaps the game
+never reads (files stay at their original offsets — no compaction). `--keep-gaps` disables this and
+stores the whole partition. `--trim-zeros` additionally skips storing dummy/padding **files** whose
+entire content is zero (e.g. Brawl's ~381 MiB `dummy*.dat`); those regions reconstruct as zeros, but —
+like the skipped gaps — they carry no hash blocks, so they must never be read (safe because filler
+files aren't). It is **off by default**: it goes a step beyond the FST-structural scrubbing that tools
+like `wit` do, so it is opt-in.
+
 ### Install hangs at a fixed point with no error?
 
 If WUP Installer GX2 freezes at the same early byte offset every time (no error message), the most

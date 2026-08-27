@@ -56,7 +56,7 @@ fn main() {
     eprintln!("building my NFS from {src} ...");
     let htk = [0x5Au8; 16];
     let mut source = SourceDisc::open(&src).unwrap();
-    let plan = plan_disc(&mut source, &VideoPatches::default()).unwrap();
+    let plan = plan_disc(&mut source, &VideoPatches::default(), true, false).unwrap();
     build_nfs(&mut source, &htk, &content, &plan).unwrap();
     let code = work.join("code");
     std::fs::create_dir_all(&code).unwrap();

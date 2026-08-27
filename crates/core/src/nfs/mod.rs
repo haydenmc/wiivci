@@ -87,9 +87,12 @@ fn disc_header_ranges() -> Vec<LbaRange> {
 /// they are recomputed here — and any `main.dol` video patches.
 ///
 /// The partition is stored **sparsely**: the pre-data header (ticket/TMD/cert/H3) plus only the
-/// hash-group runs that contain real data, skipping the (potentially multi-GB) zero gaps between
-/// files. This keeps the NFS as small as a compacted disc while leaving every file at its original
-/// offset. A first pass scans the disc for non-zero groups; a second writes them.
+/// hash-group runs in `plan.partitions[].stored_data_groups`, skipping the (potentially multi-GB)
+/// gaps between files. This keeps the NFS as small as a compacted disc while leaving every file at
+/// its original offset. Which groups are stored is decided upstream in
+/// [`crate::disc_patch::plan_disc`] via [`crate::input::SourceDisc::used_data_group_runs`] (FST
+/// coverage, optional gap-skipping and wholly-zero-file trimming); an empty run list means "store
+/// every group" (the synthetic GC disc).
 pub fn build_nfs<D: DecryptedDisc + ?Sized>(
     source: &mut D,
     htk: &[u8; 16],
@@ -276,7 +279,7 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let mut source = SourceDisc::open(&title).unwrap();
-        let plan = plan_disc(&mut source, &VideoPatches::default()).unwrap();
+        let plan = plan_disc(&mut source, &VideoPatches::default(), true, false).unwrap();
         let stats = build_nfs(&mut source, &htk, out.path(), &plan).unwrap();
         std::fs::write(out.path().join("htk.bin"), htk).unwrap();
 
@@ -334,5 +337,132 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "expected to check at least one file");
+    }
+
+    /// End-to-end check of zero-fill trimming on Brawl (two ~191 MiB all-zero `dummy*.dat` files):
+    ///
+    /// * building with `trim_zeros` materially shrinks the NFS and stays within the EGGS range cap;
+    /// * every **real** (non-dummy) file still reads back byte-for-byte through `nod`'s hash
+    ///   validation — trimming must not corrupt or drop any real data;
+    /// * a trimmed dummy region reconstructs as zeros with validation **off**.
+    ///
+    /// Note the dummy region is *not* hash-valid if read with validation on — like the skipped
+    /// inter-file gaps, a trimmed group has no stored hash blocks, so `nod` (with
+    /// `rebuild_encryption: false`, as the console reads) reports `Invalid H0 hash`. Trimming is safe
+    /// only because dummy/padding files are never read. Ignored (reads a multi-GB disc).
+    #[test]
+    #[ignore = "reads the Brawl disc; checks zero-fill trimming shrinks the NFS without corrupting real files"]
+    fn zero_trim_shrinks_nfs() {
+        use crate::disc_patch::plan_disc;
+        use crate::video::VideoPatches;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let title = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_titles/Super Smash Bros. Brawl (USA) (Rev 2).rvz");
+        if !title.exists() {
+            eprintln!("skipping: {} not present", title.display());
+            return;
+        }
+        let htk = [0x5Au8; 16];
+
+        let build = |trim: bool| {
+            let out = tempfile::tempdir().unwrap();
+            let mut source = SourceDisc::open(&title).unwrap();
+            let plan = plan_disc(&mut source, &VideoPatches::default(), true, trim).unwrap();
+            let stats = build_nfs(&mut source, &htk, out.path(), &plan).unwrap();
+            (out, stats)
+        };
+        let (_off_dir, off) = build(false);
+        let (on_dir, on) = build(true);
+        eprintln!(
+            "NFS bytes: trim-off={} trim-on={} saved={} MiB; ranges off={} on={}",
+            off.total_bytes,
+            on.total_bytes,
+            (off.total_bytes - on.total_bytes) / (1024 * 1024),
+            off.ranges.len(),
+            on.ranges.len()
+        );
+
+        // The dummy files are ~381 MiB; trimming must reclaim most of that.
+        assert!(
+            off.total_bytes > on.total_bytes + 300_000_000,
+            "trim should save ~381 MiB: off={} on={}",
+            off.total_bytes,
+            on.total_bytes
+        );
+        // The range table must stay within the EGGS cap even after the extra splits.
+        assert!(
+            on.ranges.len() <= 61,
+            "too many ranges: {}",
+            on.ranges.len()
+        );
+
+        // Classify FST files into the trimmed dummies and the five largest real files.
+        let src = SourceDisc::open(&title).unwrap();
+        let mut dummies: Vec<(u64, u64)> = Vec::new();
+        let mut real: Vec<(String, u64, u64)> = Vec::new();
+        {
+            let mut part = src.open_data_partition().unwrap();
+            let meta = part.meta().unwrap();
+            let fst = meta.fst().unwrap();
+            for (_, n, name) in fst.iter() {
+                if n.is_dir() || n.length() == 0 {
+                    continue;
+                }
+                let nm = name.map(|c| c.into_owned()).unwrap_or_default();
+                if nm.starts_with("dummy") {
+                    dummies.push((n.offset(true), n.length()));
+                } else {
+                    real.push((nm, n.offset(true), n.length()));
+                }
+            }
+        }
+        assert!(!dummies.is_empty(), "expected dummy files in Brawl");
+        real.sort_by_key(|(_, _, l)| std::cmp::Reverse(*l));
+        real.truncate(5);
+
+        std::fs::write(on_dir.path().join("htk.bin"), htk).unwrap();
+        let open = |validate: bool| {
+            nod::Disc::new_with_options(
+                on_dir.path().join("hif_000000.nfs"),
+                &nod::OpenOptions {
+                    rebuild_encryption: false,
+                    validate_hashes: validate,
+                },
+            )
+            .unwrap()
+            .open_partition_kind(nod::PartitionKind::Data)
+            .unwrap()
+        };
+
+        // Regression guard: with validation ON, the largest real files must read back byte-for-byte
+        // (trimming must not disturb any stored group).
+        let mut nfs_part = open(true);
+        let mut src_part = src.open_data_partition().unwrap();
+        for (name, off_, len) in &real {
+            let n = (*len).min(8 * 1024 * 1024) as usize;
+            let (mut a, mut b) = (vec![0u8; n], vec![0u8; n]);
+            nfs_part.seek(SeekFrom::Start(*off_)).unwrap();
+            nfs_part
+                .read_exact(&mut a)
+                .unwrap_or_else(|e| panic!("validation error reading real file {name}: {e}"));
+            src_part.seek(SeekFrom::Start(*off_)).unwrap();
+            src_part.read_exact(&mut b).unwrap();
+            assert_eq!(a, b, "real file {name} changed through trimming");
+        }
+
+        // The trimmed dummy region reconstructs as zeros (validation OFF; it is not hash-valid if
+        // read — see the note above).
+        let mut p0 = open(false);
+        let (doff, dlen) = dummies[0];
+        let n = dlen.min(8 * 1024 * 1024) as usize;
+        let mut buf = vec![0xFFu8; n];
+        p0.seek(SeekFrom::Start(doff + dlen / 2 - n as u64 / 2))
+            .unwrap();
+        p0.read_exact(&mut buf).unwrap();
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "trimmed dummy must read back as zeros"
+        );
     }
 }

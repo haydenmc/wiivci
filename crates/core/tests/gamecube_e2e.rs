@@ -66,6 +66,8 @@ fn gamecube_injection_produces_package_and_nincfg() {
         gamepad: true,
         online: false,
         video: VideoPatches::default(),
+        skip_gaps: true,
+        trim_zeros: false,
         gamecube: Some(GameCubeOptions {
             nintendont_dol,
             apploader: Vec::new(),
