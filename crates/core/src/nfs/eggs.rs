@@ -45,10 +45,14 @@ pub struct LbaRange {
 }
 
 /// The parsed/constructed EGGS header.
+///
+/// `ranges` is private so [`EggsHeader::new`]'s [`MAX_RANGES`] check cannot be bypassed by
+/// pushing onto the vec afterwards — the header has room for exactly 61 slots, and an
+/// over-long list would overrun the fixed 0x200-byte buffer in [`EggsHeader::to_bytes`].
 #[derive(Clone, Debug)]
 pub struct EggsHeader {
     /// The LBA ranges describing which logical sectors are stored.
-    pub ranges: Vec<LbaRange>,
+    ranges: Vec<LbaRange>,
 }
 
 impl EggsHeader {
@@ -61,6 +65,11 @@ impl EggsHeader {
             )));
         }
         Ok(EggsHeader { ranges })
+    }
+
+    /// The LBA ranges this header describes, in the order they are serialized.
+    pub fn ranges(&self) -> &[LbaRange] {
+        &self.ranges
     }
 
     /// Total number of sectors covered by all ranges.
@@ -139,6 +148,34 @@ mod tests {
         // trailer
         assert_eq!(&bytes[0x1FC..0x200], b"SGGE");
         assert_eq!(bytes.len(), 0x200);
+    }
+
+    /// The cap is exact: 61 ranges fill the table right up to the `SGGE` trailer, and the
+    /// accessor hands back what was constructed (the field itself is private, so nothing can push
+    /// past the cap afterwards).
+    #[test]
+    fn exactly_max_ranges_fills_the_table_up_to_the_trailer() {
+        let ranges = vec![
+            LbaRange {
+                start_sector: 1,
+                num_sectors: 2
+            };
+            MAX_RANGES
+        ];
+        let header = EggsHeader::new(ranges.clone()).unwrap();
+        assert_eq!(header.ranges(), ranges.as_slice());
+        assert_eq!(header.total_sectors(), 2 * MAX_RANGES as u64);
+
+        let bytes = header.to_bytes();
+        assert_eq!(&bytes[16..20], &[0, 0, 0, MAX_RANGES as u8]);
+        const RANGES_OFF: usize = 0x14;
+        assert_eq!(RANGES_OFF + MAX_RANGES * 8, HEADER_SIZE - 4);
+        assert_eq!(
+            &bytes[HEADER_SIZE - 12..HEADER_SIZE - 4],
+            &[0, 0, 0, 1, 0, 0, 0, 2],
+            "last slot sits immediately before the trailer"
+        );
+        assert_eq!(&bytes[HEADER_SIZE - 4..], b"SGGE");
     }
 
     #[test]
