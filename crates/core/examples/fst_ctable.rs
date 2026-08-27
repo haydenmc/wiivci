@@ -28,7 +28,8 @@ fn main() {
         decode_hashed(&TITLE_KEY, 0, &cipher)
     } else {
         decode_nonhashed(&TITLE_KEY, 0, &cipher)
-    };
+    }
+    .expect("decode fst content");
     let fst = Fst::parse(&fst_data).expect("parse fst");
     println!(
         "offset_factor={:#x} contents={} nodes={}",

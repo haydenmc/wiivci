@@ -18,9 +18,12 @@
 
 use std::io::{self, Cursor, Read, Write};
 
+use aes::cipher::block_padding::UnpadError;
 use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes::Aes128;
 use sha1::{Digest, Sha1};
+
+use crate::error::{Error, Result};
 
 /// Plaintext bytes per hashed block.
 pub const HASH_BLOCK_DATA: usize = 0xFC00;
@@ -56,10 +59,13 @@ fn cbc_encrypt(key: &Key, iv: [u8; 16], buf: &mut [u8]) {
         .expect("block-aligned buffer");
 }
 
-fn cbc_decrypt(key: &Key, iv: [u8; 16], buf: &mut [u8]) {
+/// Decrypt `buf` in place with AES-128-CBC (no padding). Errors (rather than panics) if
+/// `buf.len()` is not a multiple of the AES block size (16) — reachable with a truncated or
+/// otherwise corrupted ciphertext from an HTTP download or user-supplied file.
+fn cbc_decrypt(key: &Key, iv: [u8; 16], buf: &mut [u8]) -> std::result::Result<(), UnpadError> {
     <cbc::Decryptor<Aes128>>::new(key.into(), &iv.into())
         .decrypt_padded_mut::<NoPadding>(buf)
-        .expect("block-aligned buffer");
+        .map(|_| ())
 }
 
 fn content_iv(index: u16) -> [u8; 16] {
@@ -149,12 +155,25 @@ pub fn encode_hashed_to_writer<R: Read, W: Write>(
     mut writer: W,
 ) -> io::Result<HashedSummary> {
     const GROUP_BYTES: usize = HASH_GROUP_BLOCKS * HASH_BLOCK_DATA;
-    let mut buf = vec![0u8; GROUP_BYTES]; // reused across groups
+    // Start with room for one block and grow (doubling, capped at GROUP_BYTES) only as the
+    // content proves larger than the current buffer. This keeps peak allocation proportional to
+    // the content's actual size instead of always reserving a full ~252 MiB group — a tiny
+    // content (e.g. a 10 KB meta.xml) never grows the buffer past a block or two. Once a content
+    // needs a full group the buffer settles at GROUP_BYTES and is reused as-is for every
+    // subsequent group, exactly as before. Both the starting size and every doubled/capped size
+    // stay exact multiples of HASH_BLOCK_DATA, which the block-slicing below relies on.
+    let mut buf = vec![0u8; HASH_BLOCK_DATA];
     let mut h3: Vec<u8> = Vec::new();
     let mut size: u64 = 0;
 
     loop {
-        let filled = read_up_to(&mut reader, &mut buf)?;
+        let mut filled = read_up_to(&mut reader, &mut buf)?;
+        while filled == buf.len() && buf.len() < GROUP_BYTES {
+            let old_len = buf.len();
+            let new_len = (old_len * 2).min(GROUP_BYTES);
+            buf.resize(new_len, 0);
+            filled += read_up_to(&mut reader, &mut buf[old_len..])?;
+        }
         if filled == 0 && size > 0 {
             break; // clean EOF on a group boundary
         }
@@ -229,31 +248,89 @@ pub fn encode_hashed(key: &Key, index: u16, plaintext: &[u8]) -> EncodedContent 
 
 /// Decrypt a non-hashed content, returning the padded plaintext (inverse of
 /// [`encode_nonhashed`]; the caller truncates to the real file size using the FST).
-pub fn decode_nonhashed(key: &Key, index: u16, cipher: &[u8]) -> Vec<u8> {
+///
+/// Errors (rather than panics) if `cipher`'s length is not a multiple of the AES block size
+/// (16) — reachable from a truncated/corrupted HTTP download or user-supplied file.
+pub fn decode_nonhashed(key: &Key, index: u16, cipher: &[u8]) -> Result<Vec<u8>> {
     let mut buf = cipher.to_vec();
     if !buf.is_empty() {
-        cbc_decrypt(key, content_iv(index), &mut buf);
+        cbc_decrypt(key, content_iv(index), &mut buf).map_err(|_| {
+            Error::UnsupportedDisc(format!(
+                "non-hashed content ciphertext length {} is not a multiple of the AES block size (16)",
+                buf.len()
+            ))
+        })?;
     }
-    buf
+    Ok(buf)
 }
 
 /// Decrypt a hashed content, returning the concatenated 0xFC00 data blocks (inverse of
 /// [`encode_hashed`]; hash headers are stripped).
-pub fn decode_hashed(key: &Key, index: u16, cipher: &[u8]) -> Vec<u8> {
+///
+/// Errors (rather than silently dropping a trailing partial block via floor division) if
+/// `cipher`'s length is not an exact multiple of [`HASH_BLOCK_TOTAL`] (0x10000) — reachable from
+/// a truncated/corrupted HTTP download or user-supplied file.
+pub fn decode_hashed(key: &Key, index: u16, cipher: &[u8]) -> Result<Vec<u8>> {
+    if !cipher.len().is_multiple_of(HASH_BLOCK_TOTAL) {
+        return Err(Error::UnsupportedDisc(format!(
+            "hashed content ciphertext length {} is not a multiple of the hashed block size (0x{HASH_BLOCK_TOTAL:x})",
+            cipher.len()
+        )));
+    }
     let nblocks = cipher.len() / HASH_BLOCK_TOTAL;
     let mut out = Vec::with_capacity(nblocks * HASH_BLOCK_DATA);
     for b in 0..nblocks {
         let block = &cipher[b * HASH_BLOCK_TOTAL..(b + 1) * HASH_BLOCK_TOTAL];
         let mut header = block[..HASH_HEADER].to_vec();
-        cbc_decrypt(key, content_iv(index), &mut header);
+        cbc_decrypt(key, content_iv(index), &mut header).map_err(|_| {
+            Error::UnsupportedDisc(format!("decrypting hashed content block {b} header"))
+        })?;
         header[1] ^= index as u8; // recover the real H0 section
         let mut data_iv = [0u8; 16];
         data_iv.copy_from_slice(&header[(b % 16) * HASH_LEN..(b % 16) * HASH_LEN + 16]);
         let mut data = block[HASH_HEADER..].to_vec();
-        cbc_decrypt(key, data_iv, &mut data);
+        cbc_decrypt(key, data_iv, &mut data).map_err(|_| {
+            Error::UnsupportedDisc(format!("decrypting hashed content block {b} data"))
+        })?;
         out.extend_from_slice(&data);
     }
-    out
+    Ok(out)
+}
+
+/// Recompute the SHA-1 TMD hash for a decoded non-hashed content: simply the hash of the padded
+/// plaintext, matching what [`encode_nonhashed`] records.
+pub fn nonhashed_tmd_hash(padded_plaintext: &[u8]) -> [u8; 20] {
+    sha1(padded_plaintext)
+}
+
+/// Recompute the SHA-1 TMD hash for a decoded hashed content, without re-encrypting: rebuild the
+/// `.h3` from `plaintext` (the concatenated data blocks [`decode_hashed`] returns) using the same
+/// per-group hash-tree logic [`encode_hashed_to_writer`] uses when building, then hash that —
+/// mirroring exactly what the TMD hash covers on the encode side (the `.h3`, not the ciphertext).
+pub fn hashed_tmd_hash(plaintext: &[u8]) -> [u8; 20] {
+    sha1(&compute_h3(plaintext))
+}
+
+/// Compute the `.h3` bytes for already-decoded hashed-content plaintext (concatenated
+/// [`HASH_BLOCK_DATA`]-sized blocks), without any encryption. Groups blocks exactly as
+/// [`encode_hashed_to_writer`] does — one H3 hash per up-to-[`HASH_GROUP_BLOCKS`] blocks — so for
+/// data honestly produced by [`decode_hashed`] (always an exact multiple of [`HASH_BLOCK_DATA`])
+/// the result is byte-identical to the `.h3` the encoder would have produced for the same
+/// plaintext.
+fn compute_h3(plaintext: &[u8]) -> Vec<u8> {
+    const GROUP_BYTES: usize = HASH_GROUP_BLOCKS * HASH_BLOCK_DATA;
+    let mut h3 = Vec::new();
+    for group in plaintext.chunks(GROUP_BYTES) {
+        let hl0: Vec<Hash> = group.chunks(HASH_BLOCK_DATA).map(sha1).collect();
+        let ngroups = hl0.len().div_ceil(16);
+        let hl1: Vec<Hash> = (0..ngroups)
+            .map(|gr| sha1(&section(&hl0, gr * 16)))
+            .collect();
+        let nsuper = ngroups.div_ceil(16);
+        let hl2: Vec<Hash> = (0..nsuper).map(|s| sha1(&section(&hl1, s * 16))).collect();
+        h3.extend_from_slice(&sha1(&section(&hl2, 0)));
+    }
+    h3
 }
 
 #[cfg(test)]
@@ -346,6 +423,28 @@ mod tests {
         assert_eq!(streamed.tmd_hash, sha1(&ref_h3));
     }
 
+    /// The group buffer now starts at one block and grows by doubling (capped at a full group)
+    /// instead of always allocating a full ~252 MiB group up front — this keeps a small content
+    /// (e.g. a 10 KB `meta.xml`) cheap. Exercise several growth steps (content spans multiple
+    /// blocks, well under one group) and confirm the result still matches the whole-plaintext
+    /// reference byte-for-byte. Cheap enough to run unconditionally.
+    #[test]
+    fn streaming_matches_reference_through_buffer_growth() {
+        let key = [0x77u8; 16];
+        let index = 5u16;
+        // ~5 blocks: forces the buffer to double past 64 KiB, 128 KiB, 256 KiB while still being
+        // tiny (well under the 252 MiB group cap).
+        let len = 5 * HASH_BLOCK_DATA + 777;
+        let plain: Vec<u8> = (0..len).map(|i| (i * 13) as u8).collect();
+        let streamed = encode_hashed(&key, index, &plain);
+        let (ref_data, ref_h3) = reference_encode_hashed(&key, index, &plain);
+        assert_eq!(
+            streamed.data, ref_data,
+            "ciphertext must match the reference"
+        );
+        assert_eq!(streamed.h3.unwrap(), ref_h3, ".h3 must match the reference");
+    }
+
     /// Also cover the exact-group-multiple boundary (no partial block, no partial group) cheaply is
     /// impossible (a group is 252 MiB), so this too is ignored: 2 full groups exactly.
     #[test]
@@ -372,12 +471,73 @@ mod tests {
             .collect();
         // Hashed: decode returns block-padded data, so compare only the original prefix.
         let enc = encode_hashed(&key, 7, &plain);
-        let dec = decode_hashed(&key, 7, &enc.data);
+        let dec = decode_hashed(&key, 7, &enc.data).unwrap();
         assert_eq!(&dec[..plain.len()], &plain[..]);
+        assert_eq!(
+            hashed_tmd_hash(&dec),
+            enc.tmd_hash,
+            "recomputed .h3 hash must match"
+        );
         // Non-hashed: decode returns the 0x8000-padded plaintext.
         let enc = encode_nonhashed(&key, 2, &plain);
-        let dec = decode_nonhashed(&key, 2, &enc.data);
+        let dec = decode_nonhashed(&key, 2, &enc.data).unwrap();
         assert_eq!(&dec[..plain.len()], &plain[..]);
+        assert_eq!(nonhashed_tmd_hash(&dec), enc.tmd_hash);
+    }
+
+    #[test]
+    fn decode_nonhashed_rejects_non_block_aligned_input() {
+        let key = [0x11u8; 16];
+        // 17 bytes: not a multiple of the AES block size (16).
+        let err = decode_nonhashed(&key, 0, &[0u8; 17]).unwrap_err();
+        assert!(err.to_string().contains("AES block size"), "{err}");
+    }
+
+    #[test]
+    fn decode_hashed_rejects_non_block_aligned_input() {
+        let key = [0x11u8; 16];
+        // One byte short of a full hashed block.
+        let err = decode_hashed(&key, 0, &vec![0u8; HASH_BLOCK_TOTAL - 1]).unwrap_err();
+        assert!(err.to_string().contains("hashed block size"), "{err}");
+    }
+
+    /// A flipped byte in a hashed content's plaintext must change the recomputed TMD hash — the
+    /// verification path in `extract.rs::decode_content` relies on this to catch corruption.
+    #[test]
+    fn hashed_tmd_hash_detects_tampering() {
+        let key = [0x33u8; 16];
+        let plain: Vec<u8> = (0..HASH_BLOCK_DATA + 10).map(|i| (i * 7) as u8).collect();
+        let enc = encode_hashed(&key, 9, &plain);
+        let good = decode_hashed(&key, 9, &enc.data).unwrap();
+        assert_eq!(hashed_tmd_hash(&good), enc.tmd_hash);
+
+        let mut tampered = enc.data.clone();
+        tampered[HASH_HEADER + 5] ^= 0xFF; // flip a byte inside the first block's ciphertext
+        let bad = decode_hashed(&key, 9, &tampered).unwrap();
+        assert_ne!(
+            hashed_tmd_hash(&bad),
+            enc.tmd_hash,
+            "tampering must be detected"
+        );
+    }
+
+    /// Same for non-hashed content: a flipped byte must change the recomputed TMD hash.
+    #[test]
+    fn nonhashed_tmd_hash_detects_tampering() {
+        let key = [0x44u8; 16];
+        let plain = b"hello world".to_vec();
+        let enc = encode_nonhashed(&key, 4, &plain);
+        let good = decode_nonhashed(&key, 4, &enc.data).unwrap();
+        assert_eq!(nonhashed_tmd_hash(&good), enc.tmd_hash);
+
+        let mut tampered = enc.data.clone();
+        tampered[0] ^= 0xFF;
+        let bad = decode_nonhashed(&key, 4, &tampered).unwrap();
+        assert_ne!(
+            nonhashed_tmd_hash(&bad),
+            enc.tmd_hash,
+            "tampering must be detected"
+        );
     }
 
     fn ref_dir() -> std::path::PathBuf {
@@ -398,7 +558,7 @@ mod tests {
         iv[..8].copy_from_slice(&tik[0x1DC..0x1E4]);
         let mut tk = [0u8; 16];
         tk.copy_from_slice(&tik[0x1BF..0x1CF]);
-        cbc_decrypt(&common, iv, &mut tk);
+        cbc_decrypt(&common, iv, &mut tk).ok()?;
         Some(tk)
     }
 
@@ -431,7 +591,12 @@ mod tests {
         // Decrypt the retail hashed content back to plaintext, then re-encode: an exact
         // match proves both decode_hashed and encode_hashed against retail.
         let index = 3u16;
-        let plaintext = decode_hashed(&tk, index, &enc);
+        let plaintext = decode_hashed(&tk, index, &enc).unwrap();
+        assert_eq!(
+            hashed_tmd_hash(&plaintext),
+            sha1(&h3_ref),
+            "recomputed TMD hash mismatch"
+        );
         let out = encode_hashed(&tk, index, &plaintext);
         assert_eq!(out.h3.as_ref().unwrap(), &h3_ref, ".h3 mismatch");
         assert_eq!(out.data, enc, "hashed content ciphertext mismatch");

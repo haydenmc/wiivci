@@ -56,6 +56,32 @@ fn is_base_game_nfs(name: &str) -> bool {
     name.starts_with("hif_") && name.ends_with(".nfs")
 }
 
+/// Join `rel` onto `base`, rejecting anything that could escape `base`: an absolute path, a `..`
+/// (or `.`) component, or an empty name. Used wherever a path component comes from untrusted
+/// data — a title FST entry (from a downloaded or user-supplied title), a `.wua` archive entry
+/// name, or a base directory entry — so a hostile `../../etc/passwd`-style name can't write
+/// outside the intended output directory. Ordinary nested names behave exactly as a plain
+/// `base.join(rel)` would.
+pub(crate) fn safe_join(base: &Path, rel: &str) -> Result<PathBuf> {
+    if rel.is_empty() {
+        return Err(Error::UnsupportedDisc(
+            "refusing to join an empty path entry".into(),
+        ));
+    }
+    let rel_path = Path::new(rel);
+    for component in rel_path.components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            _ => {
+                return Err(Error::UnsupportedDisc(format!(
+                    "refusing to join unsafe path entry {rel:?}"
+                )));
+            }
+        }
+    }
+    Ok(base.join(rel_path))
+}
+
 pub(crate) fn finalize_stage(build_dir: &Path) -> Result<StagedBase> {
     let code_dir = build_dir.join("code");
     let content_dir = build_dir.join("content");
@@ -151,7 +177,7 @@ impl WuaBase {
             .collect();
 
         for (name, kind, h) in entries {
-            let path = dest.join(&name);
+            let path = safe_join(dest, &name)?;
             match kind {
                 EntryKind::Directory => self.copy_dir(h, &path)?,
                 EntryKind::File => {
@@ -249,7 +275,7 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
         let entry = entry.map_err(|e| Error::io(src, e))?;
         let name = entry.file_name();
         let from = entry.path();
-        let to = dest.join(&name);
+        let to = safe_join(dest, &name.to_string_lossy())?;
         if from.is_dir() {
             copy_tree(&from, &to)?;
         } else if !is_base_game_nfs(&name.to_string_lossy()) {
@@ -274,5 +300,41 @@ pub fn open_base(path: impl AsRef<Path>) -> Result<Box<dyn BaseSource>> {
             "base must be a directory or a .wua archive: {}",
             path.display()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_join_accepts_normal_nested_names() {
+        let base = Path::new("/out");
+        assert_eq!(
+            safe_join(base, "code/app.xml").unwrap(),
+            base.join("code/app.xml")
+        );
+        assert_eq!(safe_join(base, "meta.xml").unwrap(), base.join("meta.xml"));
+    }
+
+    #[test]
+    fn safe_join_rejects_parent_dir_traversal() {
+        let base = Path::new("/out");
+        assert!(safe_join(base, "../x").is_err());
+        assert!(safe_join(base, "a/../../b").is_err());
+        assert!(safe_join(base, "code/../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_paths() {
+        let base = Path::new("/out");
+        assert!(safe_join(base, "/abs").is_err());
+        assert!(safe_join(base, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_empty_name() {
+        let base = Path::new("/out");
+        assert!(safe_join(base, "").is_err());
     }
 }

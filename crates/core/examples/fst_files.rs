@@ -26,7 +26,8 @@ fn main() {
         decode_hashed(&TITLE_KEY, 0, &cipher)
     } else {
         decode_nonhashed(&TITLE_KEY, 0, &cipher)
-    };
+    }
+    .unwrap();
     let fst = Fst::parse(&data).unwrap();
     // Reconstruct paths.
     let mut paths = vec![String::new(); fst.nodes.len()];

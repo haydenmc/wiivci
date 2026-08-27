@@ -9,10 +9,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::base::safe_join;
 use crate::error::{Error, Result};
 
 use super::content::TYPE_HASHED;
-use super::content_crypto::{decode_hashed, decode_nonhashed};
+use super::content_crypto::{decode_hashed, decode_nonhashed, hashed_tmd_hash, nonhashed_tmd_hash};
 use super::fst::{Fst, FstNodeKind};
 use super::tmd::ContentRecord;
 
@@ -28,13 +29,29 @@ impl<F: Fn(u32) -> Result<Vec<u8>>> ContentReader for F {
     }
 }
 
-/// Decrypt a single content to its logical (hash-stripped) data.
-fn decode_content(rec: &ContentRecord, title_key: &[u8; 16], cipher: &[u8]) -> Vec<u8> {
-    if rec.content_type == TYPE_HASHED {
-        decode_hashed(title_key, rec.index, cipher)
+/// Decrypt a single content to its logical (hash-stripped) data, then verify it against the
+/// SHA-1 hash recorded for it in the TMD — the only integrity check an NUS download (fetched over
+/// plain HTTP) or a user-supplied `.app` file otherwise gets. For hashed (`0x2003`) content the
+/// TMD hash covers the `.h3` (recomputed here from the decoded plaintext, mirroring the hash-tree
+/// logic the encode side uses to derive it); for non-hashed (`0x2001`) content it covers the
+/// padded plaintext directly (see [`super::content_crypto`] and [`super::tmd`]).
+fn decode_content(rec: &ContentRecord, title_key: &[u8; 16], cipher: &[u8]) -> Result<Vec<u8>> {
+    let (data, actual_hash) = if rec.content_type == TYPE_HASHED {
+        let data = decode_hashed(title_key, rec.index, cipher)?;
+        let hash = hashed_tmd_hash(&data);
+        (data, hash)
     } else {
-        decode_nonhashed(title_key, rec.index, cipher)
+        let data = decode_nonhashed(title_key, rec.index, cipher)?;
+        let hash = nonhashed_tmd_hash(&data);
+        (data, hash)
+    };
+    if actual_hash != rec.hash {
+        return Err(Error::UnsupportedDisc(format!(
+            "content {:08x} (index {}) failed TMD hash verification — corrupted or tampered download",
+            rec.id, rec.index
+        )));
     }
+    Ok(data)
 }
 
 /// Reconstruct each FST node's full path (root is ""). Directories included.
@@ -83,7 +100,7 @@ pub fn extract_title(
         .get(&0)
         .ok_or_else(|| Error::UnsupportedDisc("title has no FST content".into()))?;
     let fst_cipher = reader.read(fst_rec.id)?;
-    let fst_data = decode_content(fst_rec, title_key, &fst_cipher);
+    let fst_data = decode_content(fst_rec, title_key, &fst_cipher)?;
     let fst = Fst::parse(&fst_data)
         .ok_or_else(|| Error::UnsupportedDisc("could not parse title FST".into()))?;
 
@@ -95,7 +112,7 @@ pub fn extract_title(
         match node.kind {
             FstNodeKind::Dir { .. } => {
                 if !rel.is_empty() {
-                    let dir = out_dir.join(rel);
+                    let dir = safe_join(out_dir, rel)?;
                     std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
                 }
             }
@@ -113,7 +130,7 @@ pub fn extract_title(
                     Some(d) => d,
                     None => {
                         let cipher = reader.read(rec.id)?;
-                        let d = decode_content(rec, title_key, &cipher);
+                        let d = decode_content(rec, title_key, &cipher)?;
                         decoded_cache.entry(node.cluster).or_insert(d)
                     }
                 };
@@ -124,7 +141,7 @@ pub fn extract_title(
                         data.len()
                     )));
                 }
-                let path = out_dir.join(rel);
+                let path = safe_join(out_dir, rel)?;
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
                 }
@@ -138,7 +155,110 @@ pub fn extract_title(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::package::content::TYPE_NONHASHED;
+    use crate::package::content_crypto::{encode_hashed, encode_nonhashed};
+    use crate::package::fst::FstNode;
     use crate::package::tmd::parse_content_records;
+
+    /// Build a minimal two-content title (content 0 = non-hashed FST, content 1 = hashed file
+    /// data) and its TMD content records, entirely in memory.
+    fn tiny_title(
+        title_key: &[u8; 16],
+        file_data: &[u8],
+    ) -> (Vec<ContentRecord>, Vec<u8>, Vec<u8>) {
+        let fst = Fst {
+            offset_factor: 0x20,
+            contents: vec![],
+            nodes: vec![
+                FstNode {
+                    name: String::new(),
+                    kind: FstNodeKind::Dir {
+                        parent_index: 0,
+                        end_index: 2,
+                    },
+                    type_flags: 0,
+                    flags: 0,
+                    cluster: 0,
+                },
+                FstNode {
+                    name: "hello.txt".into(),
+                    kind: FstNodeKind::File {
+                        offset: 0,
+                        size: file_data.len() as u64,
+                    },
+                    type_flags: 0,
+                    flags: 0,
+                    cluster: 1,
+                },
+            ],
+        };
+        let fst_bytes = fst.serialize();
+        let enc0 = encode_nonhashed(title_key, 0, &fst_bytes);
+        let enc1 = encode_hashed(title_key, 1, file_data);
+        let records = vec![
+            ContentRecord {
+                id: 0,
+                index: 0,
+                content_type: TYPE_NONHASHED,
+                size: enc0.size,
+                hash: enc0.tmd_hash,
+            },
+            ContentRecord {
+                id: 1,
+                index: 1,
+                content_type: TYPE_HASHED,
+                size: enc1.size,
+                hash: enc1.tmd_hash,
+            },
+        ];
+        (records, enc0.data, enc1.data)
+    }
+
+    /// End-to-end proof that TMD-hash verification is wired into `extract_title`: well-formed
+    /// content extracts cleanly, and a single flipped byte in the (hashed) file content's
+    /// ciphertext is caught as a hash mismatch instead of silently producing corrupted output.
+    #[test]
+    fn extract_title_verifies_tmd_hash() {
+        let title_key = [0x5Au8; 16];
+        let file_data = b"hello".to_vec();
+        let (records, content0, content1) = tiny_title(&title_key, &file_data);
+
+        // Well-formed: extraction succeeds and the file matches.
+        let reader = |id: u32| -> Result<Vec<u8>> {
+            Ok(match id {
+                0 => content0.clone(),
+                1 => content1.clone(),
+                _ => unreachable!(),
+            })
+        };
+        let out = tempfile::tempdir().unwrap();
+        extract_title(&records, &title_key, &reader, out.path(), |_| false).unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("hello.txt")).unwrap(),
+            file_data
+        );
+
+        // Tampered: flip a byte in content 1's ciphertext (past the hash header, in the
+        // encrypted data region) and confirm extraction now fails with a hash-mismatch error
+        // naming the content, instead of writing corrupted bytes.
+        let mut tampered1 = content1.clone();
+        let flip_at = tampered1.len() - 1;
+        tampered1[flip_at] ^= 0xFF;
+        let bad_reader = |id: u32| -> Result<Vec<u8>> {
+            Ok(match id {
+                0 => content0.clone(),
+                1 => tampered1.clone(),
+                _ => unreachable!(),
+            })
+        };
+        let out2 = tempfile::tempdir().unwrap();
+        let err =
+            extract_title(&records, &title_key, &bad_reader, out2.path(), |_| false).unwrap_err();
+        assert!(
+            err.to_string().contains("TMD hash verification"),
+            "unexpected error: {err}"
+        );
+    }
 
     /// Extract a retail WUP (from .dev/wup_ref, needing title.tmd/tik + content .app 00..10;
     /// the hif contents 11/12 are skipped so aren't required) and confirm the extracted files
