@@ -4,9 +4,13 @@
 //! Nintendont is free homebrew (FIX94/Nintendont, GPL). We pin a specific build so results are
 //! reproducible; the user can override with a locally-supplied `boot.dol` (and must, when offline).
 
+use std::time::Duration;
+
 use anyhow::{anyhow, Context};
 
 use crate::error::{Error, Result};
+
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The pinned Nintendont loader.
 ///
@@ -25,7 +29,14 @@ const MIN_LOADER_BYTES: usize = 512 * 1024;
 pub fn download_boot_dol() -> Result<Vec<u8>> {
     let url = NINTENDONT_LOADER_URL;
     log::info!("downloading Nintendont loader from {url}");
-    let response = reqwest::blocking::get(url)
+    let client = reqwest::blocking::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .context("building HTTP client")
+        .map_err(Error::Other)?;
+    let response = client
+        .get(url)
+        .send()
         .with_context(|| format!("fetching Nintendont loader from {url}"))
         .map_err(Error::Other)?;
     if !response.status().is_success() {

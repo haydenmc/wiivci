@@ -1,11 +1,14 @@
 //! Best-effort download of pre-made boot-texture artwork from the community
 //! UWUVCI-IMAGES repository.
 
+use std::time::Duration;
+
 use crate::error::Result;
 
 use super::images::BootTexture;
 
 const REPO_BASE: &str = "https://raw.githubusercontent.com/UWUVCI-PRIME/UWUVCI-IMAGES/master";
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The PNG filename art repositories store a texture under, or `None` if no repository
 /// art exists for that texture (the boot logo has none).
@@ -28,7 +31,18 @@ pub fn download_texture(system: &str, game_id6: &str, tex: BootTexture) -> Resul
 
     let url = format!("{REPO_BASE}/{system}/{game_id6}/{png_name}");
 
-    let response = match reqwest::blocking::get(&url) {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("failed to build HTTP client: {e}");
+            return Ok(None);
+        }
+    };
+
+    let response = match client.get(&url).send() {
         Ok(resp) => resp,
         Err(e) => {
             log::warn!("failed to reach UWUVCI-IMAGES at {url}: {e}");
