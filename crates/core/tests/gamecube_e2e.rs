@@ -30,13 +30,18 @@ fn gamecube_injection_produces_package_and_nincfg() {
     let key_hex = match std::env::var("WIIU_COMMON_KEY") {
         Ok(k) => k,
         Err(_) => {
-            eprintln!("skipping: WIIU_COMMON_KEY not set");
+            eprintln!(
+                "skipping gamecube_injection_produces_package_and_nincfg: WIIU_COMMON_KEY not present"
+            );
             return;
         }
     };
     for p in [&input, &base_wua, &cert_path] {
         if !p.exists() {
-            eprintln!("skipping: {} not present", p.display());
+            eprintln!(
+                "skipping gamecube_injection_produces_package_and_nincfg: {} not present",
+                p.display()
+            );
             return;
         }
     }

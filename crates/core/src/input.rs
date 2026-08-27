@@ -17,8 +17,8 @@ use nod::{Disc, OpenOptions, PartitionKind, SECTOR_SIZE};
 
 use crate::error::{Error, Result};
 
-/// Logical (hash-stripped) bytes per disc cluster.
-const LOG_CLUSTER: u64 = 0x7C00;
+/// Logical (hash-stripped) bytes per disc cluster (must match [`crate::consts::CLUSTER_DATA`]).
+const LOG_CLUSTER: u64 = crate::consts::CLUSTER_DATA as u64;
 /// Clusters per Wii hash group.
 const GROUP_CLUSTERS: u64 = 64;
 /// Logical bytes covered by one hash group.
@@ -217,7 +217,6 @@ pub struct SourceDisc {
     partitions: Vec<PartitionSpan>,
     raw_ticket: Vec<u8>,
     raw_tmd: Vec<u8>,
-    raw_cert_chain: Option<Vec<u8>>,
 }
 
 /// A `Read + Seek` trait object alias so a decrypted disc stream can be passed dynamically.
@@ -234,8 +233,6 @@ impl<T: Read + Seek + ?Sized> ReadSeek for T {}
 /// [`SourceDisc`] (a real Wii disc read via `nod`) and by the synthetic Wii disc authored for a
 /// GameCube/Nintendont inject (see `crate::wii_author`).
 pub trait DecryptedDisc {
-    /// Every partition's sector span, sorted ascending by start sector.
-    fn partition_spans(&self) -> &[PartitionSpan];
     /// The logical disc size in bytes.
     fn disc_size(&self) -> u64;
     /// The decrypted disc byte stream (partition data decrypted, hash blocks intact).
@@ -268,7 +265,8 @@ impl SourceDisc {
         let header = disc.header();
         if !header.is_wii() {
             return Err(Error::UnsupportedDisc(format!(
-                "'{}' is not a Wii disc (GameCube and other platforms are not yet supported)",
+                "'{}' is not a Wii disc (GameCube images are injected via GcImage::open, not \
+                 SourceDisc::open)",
                 path.display()
             )));
         }
@@ -305,8 +303,6 @@ impl SourceDisc {
             .as_ref()
             .ok_or_else(|| Error::UnsupportedDisc("partition has no TMD".into()))?
             .to_vec();
-        let raw_cert_chain = meta.raw_cert_chain.as_ref().map(|v| v.to_vec());
-
         Ok(SourceDisc {
             disc,
             path,
@@ -316,7 +312,6 @@ impl SourceDisc {
             partitions,
             raw_ticket,
             raw_tmd,
-            raw_cert_chain,
         })
     }
 
@@ -363,11 +358,6 @@ impl SourceDisc {
     /// The game partition TMD bytes (`code/rvlt.tmd`).
     pub fn raw_tmd(&self) -> &[u8] {
         &self.raw_tmd
-    }
-
-    /// The game partition certificate chain, if present.
-    pub fn raw_cert_chain(&self) -> Option<&[u8]> {
-        self.raw_cert_chain.as_deref()
     }
 
     /// The path the disc was opened from.
@@ -549,10 +539,6 @@ impl SourceDisc {
 }
 
 impl DecryptedDisc for SourceDisc {
-    fn partition_spans(&self) -> &[PartitionSpan] {
-        &self.partitions
-    }
-
     fn disc_size(&self) -> u64 {
         self.disc_size
     }
@@ -689,7 +675,10 @@ mod tests {
         let title = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_titles/Super Monkey Ball 2 (USA).rvz");
         if !title.exists() {
-            eprintln!("skipping: {} not present", title.display());
+            eprintln!(
+                "skipping opens_gamecube_test_image: {} not present",
+                title.display()
+            );
             return;
         }
 

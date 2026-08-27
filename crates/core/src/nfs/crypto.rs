@@ -8,8 +8,7 @@
 //! This mirrors `nod`'s NFS *reader* (which decrypts with the identical key/IV scheme), so
 //! output produced here round-trips back through `nod` to the original decrypted disc.
 
-use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use aes::Aes128;
+use crate::aes_cbc;
 
 /// Compute the CBC IV for a given logical sector.
 #[inline]
@@ -35,10 +34,7 @@ pub fn encrypt_sector(key: &[u8; 16], logical_sector: u32, buf: &mut [u8]) {
     );
     let iv = sector_iv(logical_sector);
     let len = aligned_len(buf);
-    if <cbc::Encryptor<Aes128>>::new(key.into(), &iv.into())
-        .encrypt_padded_mut::<NoPadding>(&mut buf[..len], len)
-        .is_err()
-    {
+    if aes_cbc::encrypt(key, iv, &mut buf[..len]).is_err() {
         debug_assert!(false, "NoPadding on a block-aligned buffer cannot fail");
     }
 }
@@ -54,10 +50,7 @@ pub fn decrypt_sector(key: &[u8; 16], logical_sector: u32, buf: &mut [u8]) {
     );
     let iv = sector_iv(logical_sector);
     let len = aligned_len(buf);
-    if <cbc::Decryptor<Aes128>>::new(key.into(), &iv.into())
-        .decrypt_padded_mut::<NoPadding>(&mut buf[..len])
-        .is_err()
-    {
+    if aes_cbc::decrypt(key, iv, &mut buf[..len]).is_err() {
         debug_assert!(false, "NoPadding on a block-aligned buffer cannot fail");
     }
 }

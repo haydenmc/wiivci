@@ -163,12 +163,23 @@ mod tests {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev/base");
         let tik = match std::fs::read(refdir.join("title.tik")) {
             Ok(t) => t,
-            Err(_) => return,
+            Err(_) => {
+                eprintln!(
+                    "skipping nus_download_matches_wua_base: {} not present",
+                    refdir.join("title.tik").display()
+                );
+                return;
+            }
         };
         if !base.join("code/app.xml").exists() {
+            eprintln!(
+                "skipping nus_download_matches_wua_base: {} not present",
+                base.join("code/app.xml").display()
+            );
             return;
         }
         let Ok(hex) = std::env::var("WIIU_COMMON_KEY") else {
+            eprintln!("skipping nus_download_matches_wua_base: WIIU_COMMON_KEY not present");
             return;
         };
         let mut common = [0u8; 16];

@@ -1887,7 +1887,6 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
- "log",
  "tempfile",
  "wiivci-core",
 ]

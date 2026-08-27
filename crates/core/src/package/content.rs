@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::util::align_up;
 
 use super::fst::{Fst, FstContent, FstNode, FstNodeKind, OFFSET_FACTOR};
 
@@ -78,10 +79,6 @@ enum Tree {
         flags: u16,
         type_flags: u8,
     },
-}
-
-fn align_up(n: u64, to: u64) -> u64 {
-    n.div_ceil(to) * to
 }
 
 fn is_hif(name: &str) -> bool {

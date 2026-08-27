@@ -33,16 +33,15 @@ use std::path::Path;
 
 use sha1::{Digest, Sha1};
 
+use crate::consts::{CLUSTER_DATA, HASH_BLOCK, SECTORS_PER_GROUP, TMD_CONTENT0_HASH};
 use crate::disc_patch::{
     h3_entry_mut, recompute_group, DiscPlan, PartitionPlan, H3_TABLE_SIZE, MAX_H3_GROUPS,
 };
 use crate::error::{Error, Result};
 use crate::input::{DecryptedDisc, PartitionSpan, ReadSeek, DISC_SECTOR_SIZE};
+use crate::util::align_up;
 
 const SECTOR: u64 = DISC_SECTOR_SIZE as u64; // 0x8000
-const HASH_BLOCK: usize = 0x400;
-const CLUSTER_DATA: usize = DISC_SECTOR_SIZE - HASH_BLOCK; // 0x7C00
-const SECTORS_PER_GROUP: usize = 64;
 
 /// Logical (hash-stripped) bytes one 64-cluster hash group carries.
 const GROUP_LOGICAL_SIZE: u64 = SECTORS_PER_GROUP as u64 * CLUSTER_DATA as u64; // 0x1F0000
@@ -84,13 +83,8 @@ const BOOT_FST_MAX_FIELD: usize = 0x42C; // >> 2
 // Wii signature type: RSA-2048 / SHA-1 (distinct from the WUP 0x00010004 in `package/`).
 const WII_SIG_RSA2048_SHA1: u32 = 0x0001_0001;
 const TMD_LEN: usize = 0x208; // header .. one 0x24 content record
-const TMD_CONTENT0_HASH: usize = 0x1F4;
 
 const DISC_MAGIC_WII: u32 = 0x5D1C_9EA3;
-
-fn align_up(x: usize, a: usize) -> usize {
-    x.div_ceil(a) * a
-}
 
 fn put_u32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
@@ -142,7 +136,6 @@ fn region_info_for(region_char: u8) -> u32 {
 pub struct AuthoredDisc {
     file: File,
     disc_size: u64,
-    spans: Vec<PartitionSpan>,
     /// Plan for `build_nfs`: the hash tree is rebuilt from the authored clusters; no patches are
     /// needed because the authored partition header already carries the matching H3 table + TMD.
     pub plan: DiscPlan,
@@ -153,10 +146,6 @@ pub struct AuthoredDisc {
 }
 
 impl DecryptedDisc for AuthoredDisc {
-    fn partition_spans(&self) -> &[PartitionSpan] {
-        &self.spans
-    }
-
     fn disc_size(&self) -> u64 {
         self.disc_size
     }
@@ -415,7 +404,6 @@ pub fn author_gc_disc(
     Ok(AuthoredDisc {
         file,
         disc_size,
-        spans: vec![span],
         plan,
         rvlt_ticket: ticket,
         rvlt_tmd: tmd,
@@ -721,7 +709,10 @@ mod tests {
         let title = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_titles/Super Monkey Ball 2 (USA).rvz");
         if !title.exists() {
-            eprintln!("skipping: {} not present", title.display());
+            eprintln!(
+                "skipping authors_real_gamecube_image_and_validates: {} not present",
+                title.display()
+            );
             return;
         }
 

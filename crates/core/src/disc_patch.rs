@@ -21,17 +21,16 @@ use std::io::{Read, Seek, SeekFrom};
 
 use sha1::{Digest, Sha1};
 
+use crate::consts::{HASH_BLOCK, SECTORS_PER_GROUP, TMD_CONTENT0_HASH, WII_SIG};
 use crate::error::{Error, Result};
 use crate::input::SourceDisc;
 use crate::video::{find_dol_edits, VideoPatches};
 
 const SECTOR: usize = 0x8000;
-const HASH_BLOCK: usize = 0x400;
 const DATA: usize = SECTOR - HASH_BLOCK; // 0x7C00
 const SUBBLOCK: usize = 0x400;
 const N_SUBBLOCKS: usize = 31;
 const SECTORS_PER_SUBGROUP: usize = 8;
-const SECTORS_PER_GROUP: usize = 64;
 
 // Sub-regions within a cluster's 0x400 hash block.
 const H0_REGION: usize = N_SUBBLOCKS * 20; // 0x26C
@@ -85,7 +84,9 @@ pub struct PartitionPlan {
 /// `main.dol` edits) while streaming the NFS.
 #[derive(Clone)]
 pub struct DiscPlan {
-    /// One entry per stored partition, matched to a structural range by `start_sector`.
+    /// One entry per stored partition. [`crate::nfs::build_nfs`] zips this positionally against
+    /// the partition ranges it derives from the source disc, so entries must stay in the same
+    /// order those partitions are written in (ascending `start_sector`).
     pub partitions: Vec<PartitionPlan>,
     /// Byte-range overlays applied to the disc-level (non-partition) sectors — used to rewrite the
     /// partition table so it lists only the data partition. Keyed by absolute disc byte offset.
@@ -173,13 +174,11 @@ fn read_at<R: Read + Seek>(disc: &mut R, offset: u64, out: &mut [u8]) -> Result<
 
 // Offsets within the partition header (at `start_sector * SECTOR`).
 const TMD_OFF_FIELD: u64 = 0x2A8; // u32, stored >> 2
-const SIG: std::ops::Range<usize> = 0x004..0x104; // RSA-2048 signature (zeroed to fakesign)
-const TMD_CONTENT0_HASH: usize = 0x1F4; // Wii TMD single content hash
 
 // The partition's own ticket sits at the partition start (offset 0); its signature shares the
 // same 0x004..0x104 layout as the TMD's.
-const TICKET_SIG: std::ops::Range<usize> = SIG;
-const TMD_SIG: std::ops::Range<usize> = SIG;
+const TICKET_SIG: std::ops::Range<usize> = WII_SIG;
+const TMD_SIG: std::ops::Range<usize> = WII_SIG;
 
 // Disc-level region info: the per-organisation age ratings (zeroed by the reference injectors).
 const REGION_AGE_RATINGS_OFF: u64 = 0x4E010;
@@ -460,7 +459,10 @@ mod tests {
         let title = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_titles/Wii Sports (USA).rvz");
         if !title.exists() {
-            eprintln!("skipping: {} not present", title.display());
+            eprintln!(
+                "skipping patched_dol_verifies_through_nod: {} not present",
+                title.display()
+            );
             return;
         }
         let patches = VideoPatches {

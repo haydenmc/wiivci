@@ -175,7 +175,10 @@ mod tests {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev/wup_ref/title.tmd");
         if !path.exists() {
-            eprintln!("skipping: {} not present", path.display());
+            eprintln!(
+                "skipping reproduces_reference_tmd_body: {} not present",
+                path.display()
+            );
             return;
         }
         let reference = std::fs::read(&path).unwrap();

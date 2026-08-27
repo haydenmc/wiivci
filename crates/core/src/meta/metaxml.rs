@@ -222,7 +222,9 @@ mod tests {
     #[test]
     fn patches_identifiers_and_names() {
         let Some(base) = base_meta_xml() else {
-            eprintln!("skipping: base meta.xml not found");
+            eprintln!(
+                "skipping patches_identifiers_and_names: .dev/base/meta/meta.xml not present"
+            );
             return;
         };
 
@@ -273,7 +275,9 @@ mod tests {
     #[test]
     fn preserves_untouched_bytes_outside_targets() {
         let Some(base) = base_meta_xml() else {
-            eprintln!("skipping: base meta.xml not found");
+            eprintln!(
+                "skipping preserves_untouched_bytes_outside_targets: .dev/base/meta/meta.xml not present"
+            );
             return;
         };
 
