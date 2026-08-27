@@ -3,7 +3,7 @@
 //! Copyright (C) 2026 Hayden. Licensed under the GNU General Public License, version 3 or
 //! later. This program comes with ABSOLUTELY NO WARRANTY. See the LICENSE file for details.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{anyhow, Context, Result};
@@ -261,6 +261,25 @@ fn build_gc_options(cli: &Cli) -> Result<GameCubeOptions> {
     })
 }
 
+/// Prepare a user-supplied `--work-dir`: create it if absent, but refuse to reuse an existing
+/// non-empty directory. `pipeline::run` stages the base title and NFS content by writing new
+/// files into `work_dir/content/` without clearing what's already there, so leftover files from a
+/// previous (e.g. larger) build — notably stale `hif_*.nfs` — would silently get packaged into
+/// the new title. Erroring out is safer than deleting a directory the user pointed us at.
+fn prepare_work_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating work dir {}", dir.display()))?;
+    let mut entries =
+        std::fs::read_dir(dir).with_context(|| format!("reading work dir {}", dir.display()))?;
+    if entries.next().is_some() {
+        return Err(anyhow!(
+            "--work-dir {} already exists and is not empty; empty it or pick another path \
+             (reusing a dirty work dir can package stale leftover files, e.g. from a previous build)",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Load a key from either an inline hex string or a file path.
 fn load_wiiu_key(arg: &str) -> Result<WiiUCommonKey> {
     let path = std::path::Path::new(arg);
@@ -317,8 +336,7 @@ fn run() -> Result<()> {
     // Use a caller-provided work dir, or a temp dir cleaned up on completion.
     let (work_path, _guard) = match &cli.work_dir {
         Some(dir) => {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("creating work dir {}", dir.display()))?;
+            prepare_work_dir(dir)?;
             (dir.clone(), None)
         }
         None => {
@@ -356,5 +374,43 @@ fn main() -> ExitCode {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod work_dir_tests {
+    use super::prepare_work_dir;
+
+    #[test]
+    fn accepts_missing_dir_by_creating_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("fresh");
+        assert!(!dir.exists());
+        prepare_work_dir(&dir).unwrap();
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn accepts_existing_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_work_dir(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn rejects_existing_nonempty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("leftover.txt"), b"stale").unwrap();
+        let err = prepare_work_dir(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("not empty"));
+        // The stale file must be left untouched, not deleted.
+        assert!(dir.path().join("leftover.txt").exists());
+    }
+
+    #[test]
+    fn rejects_existing_dir_with_stale_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("content")).unwrap();
+        let err = prepare_work_dir(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("not empty"));
     }
 }
