@@ -17,6 +17,21 @@ use nod::{Disc, OpenOptions, PartitionKind, SECTOR_SIZE};
 
 use crate::error::{Error, Result};
 
+/// Logical (hash-stripped) bytes per disc cluster.
+const LOG_CLUSTER: u64 = 0x7C00;
+/// Clusters per Wii hash group.
+const GROUP_CLUSTERS: u64 = 64;
+/// Logical bytes covered by one hash group.
+const GROUP_BYTES: u64 = GROUP_CLUSTERS * LOG_CLUSTER;
+
+/// Upper bound on the size of a `main.dol` we are willing to parse and buffer.
+///
+/// The DOL header is 18 attacker-controlled `(offset, size)` pairs whose maximum end determines the
+/// allocation, so a corrupt header can otherwise ask for ~8 GiB before the read fails. A real DOL
+/// must load into console RAM (MEM1 24 MiB + MEM2 64 MiB = 88 MiB), so 128 MiB is generous headroom
+/// that no valid disc reaches.
+const MAX_DOL_SIZE: u64 = 128 << 20;
+
 /// Returns `true` iff the `len` logical bytes at `off` in `r` are all zero. Reads in chunks with an
 /// early exit on the first non-zero byte, so non-zero regions cost almost nothing.
 fn region_is_zero<R: Read + Seek + ?Sized>(r: &mut R, off: u64, len: u64) -> std::io::Result<bool> {
@@ -45,6 +60,138 @@ fn fully_contained_groups(off: u64, len: u64, group_bytes: u64) -> std::ops::Ran
 
 fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Total size of a DOL from its 0x100-byte header: 18 sections (7 text + 11 data), offsets at
+/// `0x00..`, sizes at `0x90..`; the size is the largest section end, never below the header itself.
+///
+/// Every section is validated against `max` (see [`MAX_DOL_SIZE`]) so a corrupt header reports a
+/// descriptive error instead of driving a huge allocation.
+fn dol_size_from_header(header: &[u8; 0x100], max: u64) -> Result<u64> {
+    let mut size = 0x100u64;
+    for i in 0..18 {
+        // Both fields are `u32`, so the sum cannot overflow `u64`.
+        let off = be32(&header[i * 4..]) as u64;
+        let sz = be32(&header[0x90 + i * 4..]) as u64;
+        let end = off + sz;
+        if end > max {
+            return Err(Error::UnsupportedDisc(format!(
+                "main.dol section {i} ends at {end} (offset {off} + size {sz}), past the \
+                 {max}-byte limit"
+            )));
+        }
+        size = size.max(end);
+    }
+    Ok(size)
+}
+
+/// The inclusive range of hash-group indices touched by the logical extent `[off, off+len)`, or
+/// `None` when the extent is empty (a zero-length FST entry marks nothing, whatever its offset).
+///
+/// Errors when the extent reaches past `data_size`, the logical size of the partition's data
+/// region. That bound is deliberately the *byte* end of the data region rather than the end of the
+/// last (possibly partial) hash group: it is exactly the point past which the region cannot be
+/// read, so the marking path and the zero-scan path reject the same corrupt entries. Previously the
+/// marking path silently discarded such extents while the zero-scan path failed with a bare
+/// `UnexpectedEof`.
+fn extent_groups(
+    off: u64,
+    len: u64,
+    data_size: u64,
+) -> Result<Option<std::ops::RangeInclusive<u64>>> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let Some(end) = off.checked_add(len).filter(|&end| end <= data_size) else {
+        return Err(Error::UnsupportedDisc(format!(
+            "disc extent at offset {off} spans {len} bytes, past the end of the {data_size}-byte \
+             partition data region"
+        )));
+    };
+    let first = off / LOG_CLUSTER / GROUP_CLUSTERS;
+    let last = (end - 1) / LOG_CLUSTER / GROUP_CLUSTERS;
+    Ok(Some(first..=last))
+}
+
+/// The whole hash groups zero-fill trimming would drop for a file at `[off, off+len)`, or `None`
+/// when the file is too small to be worth scanning or covers no whole group.
+///
+/// Pure: says nothing about whether the file *is* zero — the caller scans it (see
+/// [`region_is_zero`]) and only then applies the range.
+fn zero_trim_groups(off: u64, len: u64) -> Option<std::ops::Range<u64>> {
+    /// Files too small to contain whole groups are never candidates.
+    const MIN_ZERO_FILE_GROUPS: u64 = 2;
+    if len < MIN_ZERO_FILE_GROUPS * GROUP_BYTES {
+        return None;
+    }
+    let groups = fully_contained_groups(off, len, GROUP_BYTES);
+    (groups.end > groups.start).then_some(groups)
+}
+
+/// Decide which 64-cluster hash groups the NFS stores, as coalesced `(first_group, num_groups)`
+/// runs. The pure core of [`SourceDisc::used_data_group_runs`]; all disc I/O happens in that
+/// wrapper, which passes its results in.
+///
+/// * `extents` — every logical `(offset, length)` that must be stored: the boot structures followed
+///   by every FST file entry, in disc order (the order errors are reported in).
+/// * `clusters` — logical clusters in the partition's data region; fixes both the group count
+///   (`ceil(clusters / 64)`, so the last group may be partial) and the in-bounds byte limit.
+/// * `skip_gaps` — when `false`, every group is stored regardless of `extents`.
+/// * `zero_extents` — the subset of `extents` confirmed to be entirely zero; the whole groups they
+///   contain are dropped again. Empty unless `--trim-zeros`. Applied *after* the `skip_gaps` fill,
+///   so trimming punches holes even when gap-skipping is off.
+fn plan_group_runs(
+    extents: &[(u64, u64)],
+    clusters: u64,
+    skip_gaps: bool,
+    zero_extents: &[(u64, u64)],
+) -> Result<Vec<(u32, u32)>> {
+    let ngroups = clusters.div_ceil(GROUP_CLUSTERS) as usize;
+    let data_size = clusters * LOG_CLUSTER;
+    let mut used = vec![false; ngroups];
+
+    for &(off, len) in extents {
+        // In-bounds by construction: `extent_groups` rejects anything reaching past `data_size`.
+        if let Some(groups) = extent_groups(off, len, data_size)? {
+            for g in groups {
+                used[g as usize] = true;
+            }
+        }
+    }
+
+    // Store every group when gap-skipping is disabled (the whole partition).
+    if !skip_gaps {
+        used.fill(true);
+    }
+
+    // Zero-fill trimming: drop the groups lying fully inside a wholly-zero file. Only whole groups
+    // are cleared (never a boundary group), so every cleared group is genuinely all-zero and
+    // reconstructs identically on read.
+    for &(off, len) in zero_extents {
+        if let Some(groups) = zero_trim_groups(off, len) {
+            for g in groups {
+                if (g as usize) < ngroups {
+                    used[g as usize] = false;
+                }
+            }
+        }
+    }
+
+    // Coalesce marked groups into runs.
+    let mut runs = Vec::new();
+    let mut open: Option<(u32, u32)> = None;
+    for (g, &u) in used.iter().enumerate() {
+        match (&mut open, u) {
+            (Some((_, n)), true) => *n += 1,
+            (Some(_), false) => runs.push(open.take().unwrap()),
+            (None, true) => open = Some((g as u32, 1)),
+            (None, false) => {}
+        }
+    }
+    if let Some(r) = open {
+        runs.push(r);
+    }
+    Ok(runs)
 }
 
 /// The data partition's `main.dol` and its offset within the decrypted partition data.
@@ -228,6 +375,17 @@ impl SourceDisc {
         &self.path
     }
 
+    /// Logical clusters in the data partition's data region.
+    fn data_region_clusters(&self) -> u64 {
+        (self.data_partition.data_end_sector - self.data_partition.data_start_sector) as u64
+    }
+
+    /// Logical (hash-stripped) byte size of the data partition's data region — the address space
+    /// [`SourceDisc::open_data_partition`] reads span.
+    fn data_region_size(&self) -> u64 {
+        self.data_region_clusters() * LOG_CLUSTER
+    }
+
     /// Open the data partition for logical (hash-stripped) reads.
     pub fn open_data_partition(&self) -> Result<Box<dyn nod::PartitionBase>> {
         Ok(self.disc.open_partition_kind(PartitionKind::Data)?)
@@ -264,12 +422,15 @@ impl SourceDisc {
         let mut header = [0u8; 0x100];
         part.seek(SeekFrom::Start(dol_off)).map_err(ioerr)?;
         part.read_exact(&mut header).map_err(ioerr)?;
-        // DOL: 18 sections (7 text + 11 data); offsets at 0x00.., sizes at 0x90.. .
-        let mut size = 0x100u64;
-        for i in 0..18 {
-            let off = be32(&header[i * 4..]) as u64;
-            let sz = be32(&header[0x90 + i * 4..]) as u64;
-            size = size.max(off + sz);
+        // Bound the allocation on the header's (attacker-controlled) section table before making
+        // it: each section against MAX_DOL_SIZE, then the whole DOL against the data region.
+        let size = dol_size_from_header(&header, MAX_DOL_SIZE)?;
+        let data_size = self.data_region_size();
+        if dol_off.saturating_add(size) > data_size {
+            return Err(Error::UnsupportedDisc(format!(
+                "main.dol at offset {dol_off} is {size} bytes, past the end of the \
+                 {data_size}-byte partition data region"
+            )));
         }
 
         let mut data = vec![0u8; size as usize];
@@ -305,32 +466,16 @@ impl SourceDisc {
     ///   hash). This is safe only because such filler files are never read; hence it is opt-in. A
     ///   group that only partly overlaps a zero file (sharing a boundary with real data or gap
     ///   garbage) is kept, since it is not all-zero.
+    ///
+    /// A boot structure or FST entry reaching past the end of the data region is a corrupt disc and
+    /// is rejected, identically with and without `trim_zeros`.
     pub fn used_data_group_runs(
         &self,
         skip_gaps: bool,
         trim_zeros: bool,
     ) -> Result<Vec<(u32, u32)>> {
-        const LOG_CLUSTER: u64 = 0x7C00; // logical (hash-stripped) bytes per cluster
-        const GROUP: u64 = 64; // clusters per hash group
-
-        let span = self.data_partition;
-        let total_sectors = (span.data_end_sector - span.data_start_sector) as u64;
-        let ngroups = total_sectors.div_ceil(GROUP) as usize;
-        let mut used = vec![false; ngroups];
-
-        let mut mark = |off: u64, len: u64| {
-            if len == 0 {
-                return;
-            }
-            let first = off / LOG_CLUSTER;
-            let last = (off + len - 1) / LOG_CLUSTER;
-            for c in first..=last {
-                let g = (c / GROUP) as usize;
-                if g < ngroups {
-                    used[g] = true;
-                }
-            }
-        };
+        let clusters = self.data_region_clusters();
+        let data_size = self.data_region_size();
 
         let mut part = self.open_data_partition()?;
         let ioerr = |e| Error::io("<partition>", e);
@@ -353,19 +498,16 @@ impl SourceDisc {
         let mut dolh = [0u8; 0x100];
         part.seek(SeekFrom::Start(dol_off)).map_err(ioerr)?;
         part.read_exact(&mut dolh).map_err(ioerr)?;
-        let mut dol_size = 0x100u64;
-        for i in 0..18 {
-            dol_size =
-                dol_size.max(be32(&dolh[i * 4..]) as u64 + be32(&dolh[0x90 + i * 4..]) as u64);
-        }
+        let dol_size = dol_size_from_header(&dolh, MAX_DOL_SIZE)?;
 
-        // Boot structures (regardless of on-disc order).
-        mark(0, ap_end); // boot.bin + bi2 + apploader
-        mark(dol_off, dol_size);
-        mark(fst_off, fst_size);
-
-        // Every file in the FST (collected so we can re-read zero-trim candidates once the FST's
-        // borrow on `part` ends).
+        // The boot structures (regardless of on-disc order), then every file in the FST. Collected
+        // rather than marked inline so zero-trim candidates can be re-read once the FST's borrow on
+        // `part` ends, and so the marking itself is pure (see `plan_group_runs`).
+        let mut extents: Vec<(u64, u64)> = vec![
+            (0, ap_end), // boot.bin + bi2 + apploader
+            (dol_off, dol_size),
+            (fst_off, fst_size),
+        ];
         let mut files: Vec<(u64, u64)> = Vec::new();
         {
             let meta = part.meta()?;
@@ -376,57 +518,33 @@ impl SourceDisc {
                 if node.is_dir() {
                     continue;
                 }
-                let (off, len) = (node.offset(true), node.length());
-                mark(off, len);
-                files.push((off, len));
+                files.push((node.offset(true), node.length()));
             }
         }
+        extents.extend_from_slice(&files);
 
-        // Store every group when gap-skipping is disabled (the whole partition).
-        if !skip_gaps {
-            used.fill(true);
+        // Bounds-check every extent before scanning anything, so a corrupt entry reports the same
+        // descriptive error with and without `trim_zeros` (the scan below would otherwise hit it
+        // first and fail with a bare short read). `plan_group_runs` re-checks; this only fixes
+        // *which* error a corrupt disc gets.
+        for &(off, len) in &extents {
+            let _ = extent_groups(off, len, data_size)?;
         }
 
-        // Zero-fill trimming: drop the groups that lie fully inside a wholly-zero FST file. Only
-        // whole groups contained in `[off, off+len)` are cleared (never a boundary group), and only
-        // after confirming the file is entirely zero — so every cleared group is genuinely all-zero
-        // and reconstructs identically on read.
+        // Zero-fill trimming: find the wholly-zero FST files whose contained groups can be dropped.
+        let mut zero_extents: Vec<(u64, u64)> = Vec::new();
         if trim_zeros {
-            const GROUP_BYTES: u64 = GROUP * LOG_CLUSTER;
-            const MIN_ZERO_FILE_GROUPS: u64 = 2; // ignore files too small to contain whole groups
             for &(off, len) in &files {
-                if len < MIN_ZERO_FILE_GROUPS * GROUP_BYTES {
-                    continue;
-                }
-                let groups = fully_contained_groups(off, len, GROUP_BYTES);
-                if groups.end <= groups.start {
+                if zero_trim_groups(off, len).is_none() {
                     continue;
                 }
                 if region_is_zero(part.as_mut(), off, len).map_err(ioerr)? {
-                    for g in groups {
-                        if (g as usize) < ngroups {
-                            used[g as usize] = false;
-                        }
-                    }
+                    zero_extents.push((off, len));
                 }
             }
         }
 
-        // Coalesce marked groups into runs.
-        let mut runs = Vec::new();
-        let mut open: Option<(u32, u32)> = None;
-        for (g, &u) in used.iter().enumerate() {
-            match (&mut open, u) {
-                (Some((_, n)), true) => *n += 1,
-                (Some(_), false) => runs.push(open.take().unwrap()),
-                (None, true) => open = Some((g as u32, 1)),
-                (None, false) => {}
-            }
-        }
-        if let Some(r) = open {
-            runs.push(r);
-        }
-        Ok(runs)
+        plan_group_runs(&extents, clusters, skip_gaps, &zero_extents)
     }
 }
 
@@ -610,6 +728,182 @@ mod tests {
         data.extend(vec![0u8; 200]);
         assert!(region_is_zero(&mut Cursor::new(data.clone()), 100, 200).unwrap());
         assert!(!region_is_zero(&mut Cursor::new(data), 0, 300).unwrap());
+    }
+
+    /// Logical bytes per hash group, spelled out the way the pre-refactor code did.
+    const GB: u64 = 64 * 0x7C00;
+
+    /// A 10-group data region (640 clusters), the size most planner tests work in.
+    const TEN_GROUPS: u64 = 640;
+
+    /// Build a DOL header from `(offset, size)` section pairs (offsets at `0x00..`, sizes at
+    /// `0x90..`); unlisted sections stay zero.
+    fn dol_header(sections: &[(u32, u32)]) -> [u8; 0x100] {
+        let mut h = [0u8; 0x100];
+        for (i, &(off, sz)) in sections.iter().enumerate() {
+            h[i * 4..i * 4 + 4].copy_from_slice(&off.to_be_bytes());
+            h[0x90 + i * 4..0x90 + i * 4 + 4].copy_from_slice(&sz.to_be_bytes());
+        }
+        h
+    }
+
+    /// Runs merge only across *strictly* adjacent groups; any gap, however small, splits them.
+    #[test]
+    fn plan_group_runs_coalesces_only_strictly_adjacent_groups() {
+        // One byte in each of groups 0, 1, 3 and 9 (of 10).
+        let extents = [(0, 1), (GB, 1), (3 * GB, 1), (9 * GB, 1)];
+        let runs = plan_group_runs(&extents, TEN_GROUPS, true, &[]).unwrap();
+        assert_eq!(runs, vec![(0, 2), (3, 1), (9, 1)]);
+    }
+
+    /// An extent marks every group it touches, including the partial groups at both ends.
+    #[test]
+    fn plan_group_runs_marks_every_group_an_extent_spans() {
+        // Starts halfway through group 0 and ends halfway through group 3 → groups 0..=3.
+        let runs = plan_group_runs(&[(GB / 2, 3 * GB)], TEN_GROUPS, true, &[]).unwrap();
+        assert_eq!(runs, vec![(0, 4)]);
+        // A single byte straddling nothing still marks exactly its own group.
+        let runs = plan_group_runs(&[(4 * GB - 1, 2)], TEN_GROUPS, true, &[]).unwrap();
+        assert_eq!(runs, vec![(3, 2)]);
+        // The whole region as one extent is one run covering every group.
+        let runs = plan_group_runs(&[(0, 10 * GB)], TEN_GROUPS, true, &[]).unwrap();
+        assert_eq!(runs, vec![(0, 10)]);
+    }
+
+    /// A data region whose cluster count is not a multiple of 64 still gets a (partial) final
+    /// group: `ngroups = ceil(clusters / 64)`.
+    #[test]
+    fn plan_group_runs_handles_partial_final_group() {
+        let clusters = 2 * 64 + 5; // 133 clusters → 3 groups, the last only 5 clusters wide
+        let data_size = clusters * 0x7C00;
+        // The very last readable byte lands in the partial group 2.
+        let runs = plan_group_runs(&[(data_size - 1, 1)], clusters, true, &[]).unwrap();
+        assert_eq!(runs, vec![(2, 1)]);
+        // …and `skip_gaps == false` stores all three groups, partial one included.
+        let runs = plan_group_runs(&[], clusters, false, &[]).unwrap();
+        assert_eq!(runs, vec![(0, 3)]);
+    }
+
+    /// No extents (e.g. an empty FST) marks nothing at all — the current behaviour is an empty run
+    /// list, not a whole-partition fallback.
+    #[test]
+    fn plan_group_runs_with_no_extents_yields_no_runs() {
+        assert_eq!(plan_group_runs(&[], TEN_GROUPS, true, &[]).unwrap(), vec![]);
+    }
+
+    /// Zero-length FST entries mark nothing, and are exempt from the bounds check (their offset is
+    /// meaningless), matching the pre-refactor `mark`'s early return.
+    #[test]
+    fn plan_group_runs_ignores_zero_length_extents() {
+        let data_size = TEN_GROUPS * 0x7C00;
+        let extents = [
+            (0, 1),
+            (5 * GB, 0),
+            (data_size + 1_000_000, 0),
+            (u64::MAX, 0),
+        ];
+        let runs = plan_group_runs(&extents, TEN_GROUPS, true, &[]).unwrap();
+        assert_eq!(runs, vec![(0, 1)]);
+    }
+
+    /// `skip_gaps == false` stores every group regardless of the extents given.
+    #[test]
+    fn plan_group_runs_without_skip_gaps_stores_every_group() {
+        let runs = plan_group_runs(&[(0, 1)], TEN_GROUPS, false, &[]).unwrap();
+        assert_eq!(runs, vec![(0, 10)]);
+        let runs = plan_group_runs(&[], TEN_GROUPS, false, &[]).unwrap();
+        assert_eq!(runs, vec![(0, 10)]);
+    }
+
+    /// Zero-fill trimming is applied *after* the `skip_gaps` fill, so it punches holes even when
+    /// gap-skipping is turned off.
+    #[test]
+    fn plan_group_runs_trim_applies_after_skip_gaps_fill() {
+        let zero = [(0, 3 * GB)];
+        let runs = plan_group_runs(&[], TEN_GROUPS, false, &zero).unwrap();
+        assert_eq!(runs, vec![(3, 7)]);
+    }
+
+    /// Only whole groups inside a zero file are dropped; the boundary groups it shares with other
+    /// data are kept.
+    #[test]
+    fn plan_group_runs_trims_only_fully_contained_zero_groups() {
+        let extents = [(0, 10 * GB)];
+        // Zero file from mid-group-0 to mid-group-4 → whole groups 1..4 dropped.
+        let zero = [(GB / 2, 4 * GB)];
+        let runs = plan_group_runs(&extents, TEN_GROUPS, true, &zero).unwrap();
+        assert_eq!(runs, vec![(0, 1), (4, 6)]);
+        // A group-aligned zero file drops exactly its own groups.
+        let zero = [(2 * GB, 3 * GB)];
+        let runs = plan_group_runs(&extents, TEN_GROUPS, true, &zero).unwrap();
+        assert_eq!(runs, vec![(0, 2), (5, 5)]);
+    }
+
+    /// Zero files shorter than two whole groups are never trimmed, even when group-aligned and so
+    /// nominally covering a whole group.
+    #[test]
+    fn plan_group_runs_ignores_zero_files_smaller_than_two_groups() {
+        let extents = [(0, 10 * GB)];
+        assert_eq!(zero_trim_groups(5 * GB, GB), None);
+        let runs = plan_group_runs(&extents, TEN_GROUPS, true, &[(5 * GB, GB)]).unwrap();
+        assert_eq!(runs, vec![(0, 10)]);
+        // Two groups' worth is the threshold, and is trimmed.
+        assert_eq!(zero_trim_groups(5 * GB, 2 * GB), Some(5..7));
+        let runs = plan_group_runs(&extents, TEN_GROUPS, true, &[(5 * GB, 2 * GB)]).unwrap();
+        assert_eq!(runs, vec![(0, 5), (7, 3)]);
+    }
+
+    /// Extents reaching past the data region are a corrupt disc and are rejected, rather than
+    /// silently dropped (the old marking path) or failing with a short read (the old zero scan).
+    #[test]
+    fn plan_group_runs_rejects_extent_past_data_region() {
+        let clusters = 2 * 64 + 5; // 133 clusters → 3 groups; group 2 is only 5 clusters wide
+        let data_size = clusters * 0x7C00;
+
+        // Ending exactly at the last byte is fine.
+        assert!(plan_group_runs(&[(0, data_size)], clusters, true, &[]).is_ok());
+
+        // One byte past the end is not.
+        let err = plan_group_runs(&[(data_size - 1, 2)], clusters, true, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&(data_size - 1).to_string()), "{err}");
+        assert!(err.contains(&data_size.to_string()), "{err}");
+
+        // Starting past the end is rejected too, even though its cluster still falls inside the
+        // final *partial* group (index 2 < 3) that the old code would have marked silently.
+        assert!(plan_group_runs(&[(data_size, 1)], clusters, true, &[]).is_err());
+
+        // An offset+length that overflows u64 errors instead of wrapping.
+        assert!(plan_group_runs(&[(u64::MAX, 2)], clusters, true, &[]).is_err());
+    }
+
+    /// The DOL size is the largest section end, floored at the 0x100-byte header.
+    #[test]
+    fn dol_size_from_header_takes_largest_section_end() {
+        assert_eq!(
+            dol_size_from_header(&dol_header(&[]), MAX_DOL_SIZE).unwrap(),
+            0x100
+        );
+        let h = dol_header(&[(0x100, 0x200), (0x2000, 0x40), (0x400, 0x10)]);
+        assert_eq!(dol_size_from_header(&h, MAX_DOL_SIZE).unwrap(), 0x2040);
+        // A section ending exactly at the limit is accepted.
+        let h = dol_header(&[(0x100, 0xF00)]);
+        assert_eq!(dol_size_from_header(&h, 0x1000).unwrap(), 0x1000);
+    }
+
+    /// A corrupt section table is rejected before it can drive a multi-gigabyte allocation.
+    #[test]
+    fn dol_size_from_header_rejects_oversized_sections() {
+        let h = dol_header(&[(0x100, 0x200), (u32::MAX, u32::MAX)]);
+        let err = dol_size_from_header(&h, MAX_DOL_SIZE)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("section 1"), "{err}");
+        assert!(err.contains(&MAX_DOL_SIZE.to_string()), "{err}");
+        // Just one byte over is enough.
+        let h = dol_header(&[(0x100, 0xF01)]);
+        assert!(dol_size_from_header(&h, 0x1000).is_err());
     }
 
     #[test]
