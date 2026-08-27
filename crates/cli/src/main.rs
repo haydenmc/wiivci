@@ -101,6 +101,14 @@ struct Cli {
     #[arg(long)]
     remove_dithering: bool,
 
+    /// Store the whole partition instead of skipping unused inter-file gaps (much larger NFS).
+    #[arg(long)]
+    keep_gaps: bool,
+
+    /// Skip storing dummy/padding files whose entire content is zero (smaller NFS; off by default).
+    #[arg(long)]
+    trim_zeros: bool,
+
     /// Force GameCube (Nintendont) mode. Normally auto-detected from the input image.
     #[arg(long)]
     gamecube: bool,
@@ -301,6 +309,8 @@ fn run() -> Result<()> {
             half_vfilter: cli.half_vfilter,
             dithering: cli.remove_dithering,
         },
+        skip_gaps: !cli.keep_gaps,
+        trim_zeros: cli.trim_zeros,
         gamecube,
     };
 

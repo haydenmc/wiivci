@@ -17,6 +17,32 @@ use nod::{Disc, OpenOptions, PartitionKind, SECTOR_SIZE};
 
 use crate::error::{Error, Result};
 
+/// Returns `true` iff the `len` logical bytes at `off` in `r` are all zero. Reads in chunks with an
+/// early exit on the first non-zero byte, so non-zero regions cost almost nothing.
+fn region_is_zero<R: Read + Seek + ?Sized>(r: &mut R, off: u64, len: u64) -> std::io::Result<bool> {
+    r.seek(SeekFrom::Start(off))?;
+    let mut remaining = len;
+    let mut buf = vec![0u8; 1 << 20];
+    while remaining > 0 {
+        let n = remaining.min(buf.len() as u64) as usize;
+        r.read_exact(&mut buf[..n])?;
+        if buf[..n].iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
+        remaining -= n as u64;
+    }
+    Ok(true)
+}
+
+/// The hash groups fully contained in the logical byte range `[off, off+len)`, as a `first..end`
+/// range of group indices (`group_bytes` = bytes per group). Empty (`end <= start`) when the range
+/// spans no whole group — those boundary groups also cover neighbouring data and must be kept.
+fn fully_contained_groups(off: u64, len: u64, group_bytes: u64) -> std::ops::Range<u64> {
+    let start = off.div_ceil(group_bytes);
+    let end = (off + len) / group_bytes;
+    start..end
+}
+
 fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
@@ -263,12 +289,27 @@ impl SourceDisc {
         &mut self.disc
     }
 
-    /// Runs of 64-cluster hash groups (in the data partition) that hold real data — the boot
-    /// structures (boot.bin/bi2/apploader/main.dol/FST) plus every FST file — as
-    /// `(first_group, num_groups)`. Groups not covered are inter-file "gaps" the game never reads;
-    /// storing only these lets the NFS skip them (no compaction) — a Wii disc pads gaps with
-    /// non-zero garbage, so only the FST (not a zero-scan) can tell real data from padding.
-    pub fn used_data_group_runs(&self) -> Result<Vec<(u32, u32)>> {
+    /// Runs of 64-cluster hash groups (in the data partition) to store in the NFS, as
+    /// `(first_group, num_groups)`.
+    ///
+    /// The base set is the boot structures (boot.bin/bi2/apploader/main.dol/FST) plus every FST
+    /// file. Two controls adjust it:
+    ///
+    /// * `skip_gaps` (normally `true`): drop the inter-file "gaps" the game never reads. A Wii disc
+    ///   pads gaps with non-zero garbage, so only the FST — not a zero-scan — can tell real data
+    ///   from padding. With `skip_gaps == false` every group is stored (the whole partition).
+    /// * `trim_zeros` (normally `false`): additionally drop the groups that lie **fully inside an
+    ///   FST file whose entire content is zero** (e.g. large dummy/padding files). The data
+    ///   reconstructs as zeros on read, but — exactly like a skipped gap — a trimmed group has no
+    ///   stored hash blocks, so it is *not* hash-valid if read (a validating reader reports a bad H0
+    ///   hash). This is safe only because such filler files are never read; hence it is opt-in. A
+    ///   group that only partly overlaps a zero file (sharing a boundary with real data or gap
+    ///   garbage) is kept, since it is not all-zero.
+    pub fn used_data_group_runs(
+        &self,
+        skip_gaps: bool,
+        trim_zeros: bool,
+    ) -> Result<Vec<(u32, u32)>> {
         const LOG_CLUSTER: u64 = 0x7C00; // logical (hash-stripped) bytes per cluster
         const GROUP: u64 = 64; // clusters per hash group
 
@@ -323,16 +364,52 @@ impl SourceDisc {
         mark(dol_off, dol_size);
         mark(fst_off, fst_size);
 
-        // Every file in the FST.
-        let meta = part.meta()?;
-        let fst = meta
-            .fst()
-            .map_err(|e| Error::UnsupportedDisc(format!("partition has no FST: {e}")))?;
-        for (_, node, _) in fst.iter() {
-            if node.is_dir() {
-                continue;
+        // Every file in the FST (collected so we can re-read zero-trim candidates once the FST's
+        // borrow on `part` ends).
+        let mut files: Vec<(u64, u64)> = Vec::new();
+        {
+            let meta = part.meta()?;
+            let fst = meta
+                .fst()
+                .map_err(|e| Error::UnsupportedDisc(format!("partition has no FST: {e}")))?;
+            for (_, node, _) in fst.iter() {
+                if node.is_dir() {
+                    continue;
+                }
+                let (off, len) = (node.offset(true), node.length());
+                mark(off, len);
+                files.push((off, len));
             }
-            mark(node.offset(true), node.length());
+        }
+
+        // Store every group when gap-skipping is disabled (the whole partition).
+        if !skip_gaps {
+            used.fill(true);
+        }
+
+        // Zero-fill trimming: drop the groups that lie fully inside a wholly-zero FST file. Only
+        // whole groups contained in `[off, off+len)` are cleared (never a boundary group), and only
+        // after confirming the file is entirely zero — so every cleared group is genuinely all-zero
+        // and reconstructs identically on read.
+        if trim_zeros {
+            const GROUP_BYTES: u64 = GROUP * LOG_CLUSTER;
+            const MIN_ZERO_FILE_GROUPS: u64 = 2; // ignore files too small to contain whole groups
+            for &(off, len) in &files {
+                if len < MIN_ZERO_FILE_GROUPS * GROUP_BYTES {
+                    continue;
+                }
+                let groups = fully_contained_groups(off, len, GROUP_BYTES);
+                if groups.end <= groups.start {
+                    continue;
+                }
+                if region_is_zero(part.as_mut(), off, len).map_err(ioerr)? {
+                    for g in groups {
+                        if (g as usize) < ngroups {
+                            used[g as usize] = false;
+                        }
+                    }
+                }
+            }
         }
 
         // Coalesce marked groups into runs.
@@ -516,5 +593,36 @@ mod tests {
         gc.iso_stream().seek(SeekFrom::Start(0)).unwrap();
         gc.iso_stream().read_exact(&mut head).unwrap();
         assert_eq!(&head, gc.game_id().as_slice());
+    }
+
+    #[test]
+    fn region_is_zero_detects_zero_and_nonzero() {
+        use std::io::Cursor;
+        // All zero over more than one read chunk boundary is still zero.
+        let zeros = vec![0u8; (1 << 20) + 4096];
+        assert!(region_is_zero(&mut Cursor::new(zeros), 0, (1 << 20) + 4096).unwrap());
+        // A single non-zero byte makes the region non-zero.
+        let mut one = vec![0u8; 4096];
+        one[4000] = 1;
+        assert!(!region_is_zero(&mut Cursor::new(one), 0, 4096).unwrap());
+        // The offset is honoured: a non-zero prefix outside the range is ignored.
+        let mut data = vec![0xFFu8; 100];
+        data.extend(vec![0u8; 200]);
+        assert!(region_is_zero(&mut Cursor::new(data.clone()), 100, 200).unwrap());
+        assert!(!region_is_zero(&mut Cursor::new(data), 0, 300).unwrap());
+    }
+
+    #[test]
+    fn fully_contained_groups_excludes_boundary_groups() {
+        let gb = 64 * 0x7C00u64; // logical bytes per hash group
+                                 // Group-aligned file of exactly 3 groups: all three are fully contained.
+        assert_eq!(fully_contained_groups(0, 3 * gb, gb), 0..3);
+        // Offset mid-group: the partial leading and trailing groups are excluded.
+        assert_eq!(fully_contained_groups(gb / 2, 3 * gb, gb), 1..3);
+        // A file smaller than a whole group contains none.
+        let r = fully_contained_groups(gb / 2, gb / 4, gb);
+        assert!(r.end <= r.start, "expected empty, got {r:?}");
+        // Exactly one group, aligned.
+        assert_eq!(fully_contained_groups(5 * gb, gb, gb), 5..6);
     }
 }

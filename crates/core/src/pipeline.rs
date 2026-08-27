@@ -84,6 +84,12 @@ pub struct Config {
     pub online: bool,
     /// Optional `main.dol` video patches (flicker filter / dithering). Wii path only.
     pub video: VideoPatches,
+    /// Store the data partition sparsely by skipping inter-file gaps (normally `true`). When `false`
+    /// the whole partition is stored. Wii path only.
+    pub skip_gaps: bool,
+    /// Also skip storing FST files whose entire content is zero (dummy/padding files); normally
+    /// `false`. Wii path only. See [`crate::input::SourceDisc::used_data_group_runs`].
+    pub trim_zeros: bool,
     /// When `Some`, the input is a GameCube image and is injected via Nintendont with these
     /// options (see [`run_gamecube`]). When `None`, the input is treated as a Wii disc.
     pub gamecube: Option<GameCubeOptions>,
@@ -142,7 +148,12 @@ pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
 
     // 2. Plan the whole-disc hash rebuild (RVZ/WIA zero the per-cluster hashes) plus any
     //    main.dol video patches (see crate::disc_patch).
-    let plan = disc_patch::plan_disc(&mut source, &config.video)?;
+    let plan = disc_patch::plan_disc(
+        &mut source,
+        &config.video,
+        config.skip_gaps,
+        config.trim_zeros,
+    )?;
 
     // 3. Convert the disc to NFS under content/, rebuilding the Wii hash tree.
     log::info!("building NFS (this reads the whole disc)…");

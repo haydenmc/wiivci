@@ -188,7 +188,12 @@ fn partition_table_patches(data_part_off: u64) -> Vec<(u64, Vec<u8>)> {
 /// build a bootable VC disc. `build_nfs` streams the data partition once and rebuilds its per-cluster
 /// hash blocks (RVZ/WIA sources zero them); the H3 table is valid via `nod`. Any `main.dol` edits
 /// recompute the affected groups' H3 and re-fakesign the embedded TMD.
-pub fn plan_disc(source: &mut SourceDisc, patches: &VideoPatches) -> Result<DiscPlan> {
+pub fn plan_disc(
+    source: &mut SourceDisc,
+    patches: &VideoPatches,
+    skip_gaps: bool,
+    trim_zeros: bool,
+) -> Result<DiscPlan> {
     let span = source.data_partition();
 
     // Data-partition main.dol edits (logical offsets), if any pattern matched.
@@ -270,8 +275,9 @@ pub fn plan_disc(source: &mut SourceDisc, patches: &VideoPatches) -> Result<Disc
     header_patches.push((h3_base, h3_table));
 
     // Sparse storage: only the hash groups the FST (and boot structures) actually use are written
-    // to the NFS; the multi-GB inter-file gaps are skipped without relocating any file.
-    let stored_data_groups = source.used_data_group_runs()?;
+    // to the NFS; the multi-GB inter-file gaps are skipped without relocating any file. `skip_gaps`
+    // / `trim_zeros` control gap-skipping and wholly-zero-file trimming (see `used_data_group_runs`).
+    let stored_data_groups = source.used_data_group_runs(skip_gaps, trim_zeros)?;
 
     let partitions = vec![PartitionPlan {
         start_sector: span.start_sector,
@@ -429,7 +435,7 @@ mod tests {
         drop(src0);
 
         let mut source = SourceDisc::open(&title).unwrap();
-        let plan = plan_disc(&mut source, &patches).unwrap();
+        let plan = plan_disc(&mut source, &patches, true, false).unwrap();
         let content_hash = plan
             .rvlt_content_hash
             .expect("data partition should be patched");
