@@ -95,6 +95,70 @@ impl SplitWriter {
 mod tests {
     use super::*;
 
+    /// Write `n` zero bytes in modest chunks (the file size is 250 MiB, so the boundary tests
+    /// move real bytes; keep the in-memory buffer small).
+    fn write_n(w: &mut SplitWriter, mut n: u64) {
+        let chunk = vec![0u8; 8 << 20];
+        while n > 0 {
+            let take = (chunk.len() as u64).min(n) as usize;
+            w.write_all(&chunk[..take]).unwrap();
+            n -= take as u64;
+        }
+    }
+
+    /// Exactly one file's worth must stay in one file — the rollover happens lazily, on the write
+    /// *after* the boundary, so a build whose total lands on the boundary emits no stray empty
+    /// `hif_000001.nfs`.
+    #[test]
+    fn exact_file_size_does_not_open_a_second_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SplitWriter::new(dir.path()).unwrap();
+        write_n(&mut w, NFS_FILE_SIZE);
+        assert_eq!(w.file_count(), 1);
+        assert_eq!(w.total_written(), NFS_FILE_SIZE);
+        assert_eq!(w.finish().unwrap(), 1);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("hif_000000.nfs"))
+                .unwrap()
+                .len(),
+            NFS_FILE_SIZE
+        );
+        assert!(!dir.path().join("hif_000001.nfs").exists());
+    }
+
+    /// A single `write_all` may span more than one boundary; each is honoured in turn.
+    #[test]
+    fn single_write_crossing_two_boundaries_creates_three_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SplitWriter::new(dir.path()).unwrap();
+        write_n(&mut w, NFS_FILE_SIZE - 1);
+        // Fills the 1 remaining byte of file 0, all of file 1, and 1 byte of file 2.
+        let big = vec![0xCDu8; NFS_FILE_SIZE as usize + 2];
+        w.write_all(&big).unwrap();
+        assert_eq!(w.file_count(), 3);
+        assert_eq!(w.total_written(), 2 * NFS_FILE_SIZE + 1);
+        assert_eq!(w.finish().unwrap(), 3);
+        let len = |n: &str| std::fs::metadata(dir.path().join(n)).unwrap().len();
+        assert_eq!(len("hif_000000.nfs"), NFS_FILE_SIZE);
+        assert_eq!(len("hif_000001.nfs"), NFS_FILE_SIZE);
+        assert_eq!(len("hif_000002.nfs"), 1);
+    }
+
+    #[test]
+    fn total_written_counts_every_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SplitWriter::new(dir.path()).unwrap();
+        assert_eq!(w.total_written(), 0);
+        w.write_all(&[]).unwrap();
+        assert_eq!(w.total_written(), 0);
+        w.write_all(&[0u8; 0x200]).unwrap();
+        assert_eq!(w.total_written(), 0x200);
+        w.write_all(&[0u8; 0x8000]).unwrap();
+        assert_eq!(w.total_written(), 0x200 + 0x8000);
+        assert_eq!(w.file_count(), 1);
+        w.finish().unwrap();
+    }
+
     #[test]
     fn splits_at_boundary() {
         let dir = tempfile::tempdir().unwrap();
