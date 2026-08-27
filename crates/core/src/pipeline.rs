@@ -279,6 +279,22 @@ fn run_gamecube(mut config: Config, work_dir: &Path) -> Result<Summary> {
         nfs_stats.total_bytes
     );
 
+    // The synthetic disc image (a full-disc-size scratch file) is only needed to build the NFS;
+    // remove it now instead of leaving it in work_dir alongside the NFS content, which would
+    // otherwise roughly double peak scratch usage for the rest of the build.
+    match std::fs::metadata(&disc_path).and_then(|m| {
+        let len = m.len();
+        std::fs::remove_file(&disc_path).map(|()| len)
+    }) {
+        Ok(freed) => log::info!(
+            "removed scratch {} ({:.1} MiB freed)",
+            disc_path.display(),
+            freed as f64 / (1024.0 * 1024.0)
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::io(&disc_path, e)),
+    }
+
     // 4. Write the synthetic disc's Wii ticket/TMD as rvlt.tik / rvlt.tmd.
     let tik_path = staged.code_dir.join("rvlt.tik");
     std::fs::write(&tik_path, &authored.rvlt_ticket).map_err(|e| Error::io(&tik_path, e))?;
@@ -332,11 +348,20 @@ fn run_gamecube(mut config: Config, work_dir: &Path) -> Result<Summary> {
         cheat_path: gc_opts.cheat_path.clone(),
         ..Default::default()
     });
-    let nincfg_path = config
-        .out
+    // Resolve --out to an absolute path first: a bare relative `--out` (e.g. `MyGame`, with no
+    // parent component) would otherwise leave `parent()` ambiguous, landing nincfg.bin wherever
+    // the process happens to be running from rather than reliably next to the output.
+    let out_abs = std::path::absolute(&config.out).map_err(|e| Error::io(&config.out, e))?;
+    let nincfg_path = out_abs
         .parent()
-        .unwrap_or(config.out.as_path())
+        .unwrap_or(out_abs.as_path())
         .join("nincfg.bin");
+    if nincfg_path.exists() {
+        log::warn!(
+            "overwriting existing {} (each build's nincfg.bin is game-specific)",
+            nincfg_path.display()
+        );
+    }
     std::fs::write(&nincfg_path, nincfg).map_err(|e| Error::io(&nincfg_path, e))?;
     log::info!(
         "wrote {} — copy it to your SD card root for Nintendont",

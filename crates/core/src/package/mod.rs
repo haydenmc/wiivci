@@ -138,6 +138,54 @@ impl Read for ContentPlaintextReader {
     }
 }
 
+/// Returns `true` if `name` is a known WUP output filename this crate writes: an 8-hex-digit
+/// content id with a `.app` or `.h3` extension, or one of `title.tmd`/`title.tik`/`title.cert`.
+fn is_known_output_name(name: &str) -> bool {
+    if name == "title.tmd" || name == "title.tik" || name == "title.cert" {
+        return true;
+    }
+    let Some(stem) = name
+        .strip_suffix(".app")
+        .or_else(|| name.strip_suffix(".h3"))
+    else {
+        return false;
+    };
+    stem.len() == 8 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Remove pre-existing WUP output files from `out_dir` before a build writes new ones.
+///
+/// A rebuild that produces fewer contents than a previous run into the same `out_dir` would
+/// otherwise leave orphan `NNNNNNNN.app`/`.h3` files behind; WUP installers copy everything they
+/// find, so a stale orphan would get installed alongside the new title. Only files matching the
+/// known output patterns are removed (see [`is_known_output_name`]); nothing else in `out_dir`
+/// (other files, subdirectories) is touched.
+fn clean_stale_outputs(out_dir: &Path) -> Result<()> {
+    let entries = match fs::read_dir(out_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::io(out_dir, e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::io(out_dir, e))?;
+        let path = entry.path();
+        let is_file = entry
+            .file_type()
+            .map_err(|e| Error::io(&path, e))?
+            .is_file();
+        if !is_file {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if is_known_output_name(name) {
+            fs::remove_file(&path).map_err(|e| Error::io(&path, e))?;
+        }
+    }
+    Ok(())
+}
+
 /// Build a complete installable WUP package from a staged build directory into `out_dir`.
 pub fn build_package(
     build_dir: &Path,
@@ -145,6 +193,7 @@ pub fn build_package(
     params: &PackageParams,
 ) -> Result<PackageStats> {
     fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
+    clean_stale_outputs(out_dir)?;
     let plan = content::plan(build_dir, params.title_id)?;
 
     let mut records = Vec::with_capacity(plan.contents.len());
@@ -271,5 +320,59 @@ mod tests {
             got2.extend_from_slice(&small[..n]);
         }
         assert_eq!(got2, expected, "small-buffer reads must also match");
+    }
+
+    #[test]
+    fn known_output_name_matches_only_expected_patterns() {
+        assert!(is_known_output_name("0000000f.app"));
+        assert!(is_known_output_name("0000000f.h3"));
+        assert!(is_known_output_name("deadbeef.app"));
+        assert!(is_known_output_name("title.tmd"));
+        assert!(is_known_output_name("title.tik"));
+        assert!(is_known_output_name("title.cert"));
+
+        assert!(!is_known_output_name("readme.txt"));
+        assert!(!is_known_output_name("deadbeef.app.bak"));
+        assert!(!is_known_output_name("deadbee.app")); // 7 hex digits
+        assert!(!is_known_output_name("deadbeefg.app")); // 9 chars
+        assert!(!is_known_output_name("nothex01.app")); // non-hex chars
+        assert!(!is_known_output_name("content"));
+    }
+
+    /// `clean_stale_outputs` must remove only files matching the known output patterns, leaving
+    /// decoy files and subdirectories untouched.
+    #[test]
+    fn clean_stale_outputs_removes_only_known_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+
+        let known = ["0000000f.app", "0000000f.h3", "title.tmd"];
+        let decoys = ["readme.txt", "deadbeef.app.bak"];
+        for name in known.iter().chain(decoys.iter()) {
+            fs::write(p.join(name), b"stale").unwrap();
+        }
+        fs::create_dir(p.join("subdir")).unwrap();
+        fs::write(p.join("subdir/00000001.app"), b"nested").unwrap();
+
+        clean_stale_outputs(p).unwrap();
+
+        for name in known {
+            assert!(!p.join(name).exists(), "{name} should have been removed");
+        }
+        for name in decoys {
+            assert!(p.join(name).exists(), "{name} should NOT have been removed");
+        }
+        assert!(p.join("subdir").is_dir(), "subdirectory must be untouched");
+        assert!(
+            p.join("subdir/00000001.app").exists(),
+            "files inside subdirectories must be untouched"
+        );
+    }
+
+    #[test]
+    fn clean_stale_outputs_on_missing_dir_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist-yet");
+        clean_stale_outputs(&missing).unwrap();
     }
 }
