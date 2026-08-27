@@ -16,6 +16,8 @@
 //!   XORed with the content index before the header is encrypted (IV = `u16be(index) ++ 0*14`).
 //! * The data is encrypted with IV = the real `H0[b][0..16]`.
 
+use std::io::{self, Cursor, Read, Write};
+
 use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes::Aes128;
 use sha1::{Digest, Sha1};
@@ -28,6 +30,12 @@ pub const HASH_BLOCK_TOTAL: usize = 0x10000;
 pub const HASH_HEADER: usize = 0x400;
 /// Padding unit for non-hashed content.
 pub const CONTENT_PADDING: usize = 0x8000;
+
+/// Blocks per top-level H3 group. Must equal 16^3: the hash tree is 16-ary at every level, so one
+/// H3 group spans exactly 16*16*16 blocks and every hash a block's header references lives inside
+/// its own group. The streaming encoder relies on this to process one group at a time and still
+/// produce byte-identical output — do not change it.
+pub const HASH_GROUP_BLOCKS: usize = 4096;
 
 const HASH_LEN: usize = 20;
 const SECTION: usize = 16 * HASH_LEN; // 0x140: sixteen hashes per level section
@@ -105,65 +113,117 @@ fn section(hashes: &[Hash], base: usize) -> Vec<u8> {
     out
 }
 
-/// Encrypt a hashed content (`0x2003`), returning the ciphertext, `.h3`, and TMD hash.
-pub fn encode_hashed(key: &Key, index: u16, plaintext: &[u8]) -> EncodedContent {
-    let nblocks = plaintext.len().div_ceil(HASH_BLOCK_DATA).max(1);
+/// The `.h3`, TMD hash, and encrypted size produced by streaming a hashed content to a writer.
+pub struct HashedSummary {
+    /// The `.h3` hash file (concatenated H3 hashes).
+    pub h3: Vec<u8>,
+    /// The 20-byte SHA-1 of the `.h3`, recorded in the TMD.
+    pub tmd_hash: Hash,
+    /// The encrypted content size in bytes.
+    pub size: u64,
+}
 
-    // H0: one hash per data block (last block zero-padded to 0xFC00).
-    let mut h0 = Vec::with_capacity(nblocks);
-    for b in 0..nblocks {
-        let start = b * HASH_BLOCK_DATA;
-        let mut block = vec![0u8; HASH_BLOCK_DATA];
-        if start < plaintext.len() {
-            let end = (start + HASH_BLOCK_DATA).min(plaintext.len());
-            block[..end - start].copy_from_slice(&plaintext[start..end]);
+/// Read up to `buf.len()` bytes into `buf`, returning how many were filled (`< buf.len()` means the
+/// reader hit EOF). `read` may return short, so loop until the buffer is full or EOF.
+fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = reader.read(&mut buf[filled..])?;
+        if n == 0 {
+            break;
         }
-        h0.push(sha1(&block));
+        filled += n;
     }
+    Ok(filled)
+}
 
-    // H1 over H0 sections (per group of 16 blocks), H2 over H1 sections, H3 over H2 sections.
-    let ngroups = nblocks.div_ceil(16);
-    let h1: Vec<Hash> = (0..ngroups).map(|g| sha1(&section(&h0, g * 16))).collect();
-    let nsuper = ngroups.div_ceil(16);
-    let h2: Vec<Hash> = (0..nsuper).map(|s| sha1(&section(&h1, s * 16))).collect();
-    let nh3 = nsuper.div_ceil(16);
-    let mut h3 = Vec::with_capacity(nh3 * HASH_LEN);
-    for t in 0..nh3 {
-        h3.extend_from_slice(&sha1(&section(&h2, t * 16)));
-    }
+/// Encrypt a hashed content (`0x2003`) by streaming `reader` to `writer` one H3 group
+/// ([`HASH_GROUP_BLOCKS`] blocks ≈ 252 MiB) at a time, so peak memory is one group rather than the
+/// whole content. Output is byte-identical to a whole-plaintext encode: every hash a block's header
+/// references lives inside that block's own group (the tree is 16-ary and a group is 16^3 blocks),
+/// so each group's hashes and ciphertext depend only on that group's plaintext.
+pub fn encode_hashed_to_writer<R: Read, W: Write>(
+    key: &Key,
+    index: u16,
+    mut reader: R,
+    mut writer: W,
+) -> io::Result<HashedSummary> {
+    const GROUP_BYTES: usize = HASH_GROUP_BLOCKS * HASH_BLOCK_DATA;
+    let mut buf = vec![0u8; GROUP_BYTES]; // reused across groups
+    let mut h3: Vec<u8> = Vec::new();
+    let mut size: u64 = 0;
 
-    // Emit each block: real hash header (with byte[1] obfuscated), then encrypted data.
-    let mut data = Vec::with_capacity(nblocks * HASH_BLOCK_TOTAL);
-    for b in 0..nblocks {
-        let mut header = Vec::with_capacity(HASH_HEADER);
-        header.extend_from_slice(&section(&h0, (b / 16) * 16));
-        header.extend_from_slice(&section(&h1, (b / 256) * 16));
-        header.extend_from_slice(&section(&h2, (b / 4096) * 16));
-        header.resize(HASH_HEADER, 0);
-        header[1] ^= index as u8;
-        cbc_encrypt(key, content_iv(index), &mut header);
-
-        let start = b * HASH_BLOCK_DATA;
-        let mut block = vec![0u8; HASH_BLOCK_DATA];
-        if start < plaintext.len() {
-            let end = (start + HASH_BLOCK_DATA).min(plaintext.len());
-            block[..end - start].copy_from_slice(&plaintext[start..end]);
+    loop {
+        let filled = read_up_to(&mut reader, &mut buf)?;
+        if filled == 0 && size > 0 {
+            break; // clean EOF on a group boundary
         }
-        let mut data_iv = [0u8; 16];
-        data_iv.copy_from_slice(&h0[b][..16]);
-        cbc_encrypt(key, data_iv, &mut block);
+        // An empty content still encodes one zero block (matches nblocks.max(1)).
+        let g = if filled == 0 {
+            1
+        } else {
+            filled.div_ceil(HASH_BLOCK_DATA)
+        };
+        // Zero the tail of the last (possibly partial) block; the buffer is reused, so stale bytes
+        // from a previous group could otherwise leak in.
+        let used = g * HASH_BLOCK_DATA;
+        if filled < used {
+            buf[filled..used].fill(0);
+        }
 
-        data.extend_from_slice(&header);
-        data.extend_from_slice(&block);
+        // Local hash tree for this group only. G <= 16^3, so exactly one H3.
+        let hl0: Vec<Hash> = (0..g)
+            .map(|bl| sha1(&buf[bl * HASH_BLOCK_DATA..(bl + 1) * HASH_BLOCK_DATA]))
+            .collect();
+        let ngroups = g.div_ceil(16);
+        let hl1: Vec<Hash> = (0..ngroups)
+            .map(|gr| sha1(&section(&hl0, gr * 16)))
+            .collect();
+        let nsuper = ngroups.div_ceil(16);
+        let hl2: Vec<Hash> = (0..nsuper).map(|s| sha1(&section(&hl1, s * 16))).collect();
+        h3.extend_from_slice(&sha1(&section(&hl2, 0)));
+
+        // Emit each block: real hash header (byte[1] obfuscated), then encrypted data.
+        for bl in 0..g {
+            let mut header = Vec::with_capacity(HASH_HEADER);
+            header.extend_from_slice(&section(&hl0, (bl / 16) * 16));
+            header.extend_from_slice(&section(&hl1, (bl / 256) * 16));
+            header.extend_from_slice(&section(&hl2, 0));
+            header.resize(HASH_HEADER, 0);
+            header[1] ^= index as u8;
+            cbc_encrypt(key, content_iv(index), &mut header);
+
+            let mut data_iv = [0u8; 16];
+            data_iv.copy_from_slice(&hl0[bl][..16]);
+            let block = &mut buf[bl * HASH_BLOCK_DATA..(bl + 1) * HASH_BLOCK_DATA];
+            cbc_encrypt(key, data_iv, block);
+
+            writer.write_all(&header)?;
+            writer.write_all(block)?;
+            size += HASH_BLOCK_TOTAL as u64;
+        }
+
+        if filled < GROUP_BYTES {
+            break; // this was the final (partial) group
+        }
     }
 
     let tmd_hash = sha1(&h3);
-    let size = data.len() as u64;
+    Ok(HashedSummary { h3, tmd_hash, size })
+}
+
+/// Encrypt a hashed content (`0x2003`) in memory, returning the ciphertext, `.h3`, and TMD hash.
+/// Thin wrapper over [`encode_hashed_to_writer`] (in-memory `Vec`/`Cursor` I/O is infallible).
+pub fn encode_hashed(key: &Key, index: u16, plaintext: &[u8]) -> EncodedContent {
+    let mut data =
+        Vec::with_capacity(plaintext.len().div_ceil(HASH_BLOCK_DATA).max(1) * HASH_BLOCK_TOTAL);
+    let summary = encode_hashed_to_writer(key, index, Cursor::new(plaintext), &mut data)
+        .expect("in-memory Vec I/O is infallible");
     EncodedContent {
         data,
-        h3: Some(h3),
-        tmd_hash,
-        size,
+        h3: Some(summary.h3),
+        tmd_hash: summary.tmd_hash,
+        size: summary.size,
     }
 }
 
@@ -215,6 +275,89 @@ mod tests {
         let out = encode_hashed(&[0x22; 16], 3, &plain);
         assert_eq!(out.size, 3 * HASH_BLOCK_TOTAL as u64);
         assert_eq!(out.h3.as_ref().unwrap().len(), HASH_LEN);
+    }
+
+    /// Verbatim copy of the original whole-plaintext hashed encoder, kept as an oracle to prove the
+    /// streaming encoder is byte-identical across H3-group boundaries. Returns `(data, h3)`.
+    fn reference_encode_hashed(key: &Key, index: u16, plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let nblocks = plaintext.len().div_ceil(HASH_BLOCK_DATA).max(1);
+        let mut h0 = Vec::with_capacity(nblocks);
+        for b in 0..nblocks {
+            let start = b * HASH_BLOCK_DATA;
+            let mut block = vec![0u8; HASH_BLOCK_DATA];
+            if start < plaintext.len() {
+                let end = (start + HASH_BLOCK_DATA).min(plaintext.len());
+                block[..end - start].copy_from_slice(&plaintext[start..end]);
+            }
+            h0.push(sha1(&block));
+        }
+        let ngroups = nblocks.div_ceil(16);
+        let h1: Vec<Hash> = (0..ngroups).map(|g| sha1(&section(&h0, g * 16))).collect();
+        let nsuper = ngroups.div_ceil(16);
+        let h2: Vec<Hash> = (0..nsuper).map(|s| sha1(&section(&h1, s * 16))).collect();
+        let nh3 = nsuper.div_ceil(16);
+        let mut h3 = Vec::with_capacity(nh3 * HASH_LEN);
+        for t in 0..nh3 {
+            h3.extend_from_slice(&sha1(&section(&h2, t * 16)));
+        }
+        let mut data = Vec::with_capacity(nblocks * HASH_BLOCK_TOTAL);
+        for b in 0..nblocks {
+            let mut header = Vec::with_capacity(HASH_HEADER);
+            header.extend_from_slice(&section(&h0, (b / 16) * 16));
+            header.extend_from_slice(&section(&h1, (b / 256) * 16));
+            header.extend_from_slice(&section(&h2, (b / 4096) * 16));
+            header.resize(HASH_HEADER, 0);
+            header[1] ^= index as u8;
+            cbc_encrypt(key, content_iv(index), &mut header);
+            let start = b * HASH_BLOCK_DATA;
+            let mut block = vec![0u8; HASH_BLOCK_DATA];
+            if start < plaintext.len() {
+                let end = (start + HASH_BLOCK_DATA).min(plaintext.len());
+                block[..end - start].copy_from_slice(&plaintext[start..end]);
+            }
+            let mut data_iv = [0u8; 16];
+            data_iv.copy_from_slice(&h0[b][..16]);
+            cbc_encrypt(key, data_iv, &mut block);
+            data.extend_from_slice(&header);
+            data.extend_from_slice(&block);
+        }
+        (data, h3)
+    }
+
+    /// The streaming encoder must be byte-identical to the whole-plaintext reference across an H3
+    /// group boundary (spans 2 groups) and with a partial final block. ~258 MiB, so `#[ignore]`d.
+    #[test]
+    #[ignore = "encodes ~258 MiB; run manually to verify cross-group streaming equivalence"]
+    fn streaming_matches_reference_across_groups() {
+        let key = [0x9Cu8; 16];
+        let index = 11u16;
+        // 4097 blocks (one full H3 group + 1) plus a partial final block.
+        let len = (HASH_GROUP_BLOCKS + 1) * HASH_BLOCK_DATA + 123;
+        let plain: Vec<u8> = (0..len)
+            .map(|i| i.wrapping_mul(31).wrapping_add(7) as u8)
+            .collect();
+        let streamed = encode_hashed(&key, index, &plain);
+        let (ref_data, ref_h3) = reference_encode_hashed(&key, index, &plain);
+        assert_eq!(
+            streamed.data, ref_data,
+            "ciphertext must match the reference"
+        );
+        assert_eq!(streamed.h3.unwrap(), ref_h3, ".h3 must match the reference");
+        assert_eq!(streamed.tmd_hash, sha1(&ref_h3));
+    }
+
+    /// Also cover the exact-group-multiple boundary (no partial block, no partial group) cheaply is
+    /// impossible (a group is 252 MiB), so this too is ignored: 2 full groups exactly.
+    #[test]
+    #[ignore = "encodes ~504 MiB; run manually"]
+    fn streaming_matches_reference_exact_two_groups() {
+        let key = [0x5Eu8; 16];
+        let len = 2 * HASH_GROUP_BLOCKS * HASH_BLOCK_DATA; // exact multiple of group AND block
+        let plain: Vec<u8> = (0..len).map(|i| (i >> 7) as u8).collect();
+        let streamed = encode_hashed(&key, 4, &plain);
+        let (ref_data, ref_h3) = reference_encode_hashed(&key, 4, &plain);
+        assert_eq!(streamed.data, ref_data);
+        assert_eq!(streamed.h3.unwrap(), ref_h3);
     }
 
     // --- Cross-validation against a retail package ------------------------------------
