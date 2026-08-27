@@ -185,47 +185,17 @@ pub fn run(mut config: Config, work_dir: &Path) -> Result<Summary> {
     // 5. Fakesign-patch fw.img so the (fakesigned) title is accepted.
     fwimg::patch_file(&staged.code_dir.join("fw.img"), fwimg::FAKESIGN_PATCHES)?;
 
-    // 6. Metadata: app.xml + meta.xml.
-    std::fs::write(staged.code_dir.join("app.xml"), appxml::generate(&ids))
-        .map_err(|e| Error::io(staged.code_dir.join("app.xml"), e))?;
-
-    let title = resolve_title(&config, &game_id);
-    let meta_path = staged.meta_dir.join("meta.xml");
-    let base_meta = std::fs::read_to_string(&meta_path).map_err(|e| Error::io(&meta_path, e))?;
-    let patched = patch_meta(
-        &base_meta,
-        &MetaOptions {
-            ids: &ids,
-            long_name: &title,
-            short_name: &title,
-            publisher: "",
-            region: config.region.code(),
-            drc_use: config.gamepad,
-        },
-    )?;
-    std::fs::write(&meta_path, patched).map_err(|e| Error::io(&meta_path, e))?;
-
-    // 7. Boot textures (icon / TV / DRC).
-    resolve_textures(&config, "wii", &game_id, &staged.meta_dir)?;
-
-    // 8. Package.
-    log::info!("packaging WUP into {}", config.out.display());
-    let params = PackageParams {
-        title_id: ids.title_id,
-        group_id: (ids.group_id & 0xFFFF) as u16,
-        wiiu_common_key: config.wiiu_common_key.0,
-        title_key: TITLE_KEY,
-        cert: &config.cert,
-    };
-    let package = build_package(work_dir, &config.out, &params)?;
-
-    Ok(Summary {
-        title_id: ids.title_id,
+    // 6-8. Metadata, boot textures, packaging (shared with the GameCube path).
+    finish_package(
+        &config,
+        work_dir,
+        &staged.code_dir,
+        &staged.meta_dir,
+        &ids,
         game_id,
-        title,
-        package,
-        out: config.out.clone(),
-    })
+        "wii",
+        |_package| Ok(()),
+    )
 }
 
 /// Run a GameCube injection: author a synthetic Wii disc that boots Nintendont (with the game as
@@ -305,17 +275,81 @@ fn run_gamecube(mut config: Config, work_dir: &Path) -> Result<Summary> {
     // 5. Patch fw.img: fakesign + homebrew (AHBPROT/MEMPROT) so Nintendont gets hardware access.
     fwimg::patch_file(&staged.code_dir.join("fw.img"), fwimg::HOMEBREW_PATCHES)?;
 
-    // 6. Metadata: app.xml + meta.xml.
-    std::fs::write(staged.code_dir.join("app.xml"), appxml::generate(&ids))
-        .map_err(|e| Error::io(staged.code_dir.join("app.xml"), e))?;
+    // 6-8. Metadata, boot textures, packaging (shared with the Wii path). Step 9 (nincfg.bin) runs
+    // as the packaging hook below, after build_package but before the Summary is built.
+    finish_package(
+        &config,
+        work_dir,
+        &staged.code_dir,
+        &staged.meta_dir,
+        &ids,
+        game_id,
+        "gcn",
+        |_package| {
+            // 9. Emit nincfg.bin next to the output package (it belongs at the SD-card root, not
+            // in the WUP).
+            let nincfg = nincfg::generate(&NincfgOptions {
+                game_id: game_id4,
+                widescreen: gc_opts.widescreen,
+                language: gc_opts.language,
+                video_mode: gc_opts.video_mode,
+                memcard_emu: gc_opts.memcard_emu,
+                cheat_path: gc_opts.cheat_path.clone(),
+                ..Default::default()
+            });
+            // Resolve --out to an absolute path first: a bare relative `--out` (e.g. `MyGame`,
+            // with no parent component) would otherwise leave `parent()` ambiguous, landing
+            // nincfg.bin wherever the process happens to be running from rather than reliably
+            // next to the output.
+            let out_abs =
+                std::path::absolute(&config.out).map_err(|e| Error::io(&config.out, e))?;
+            let nincfg_path = out_abs
+                .parent()
+                .unwrap_or(out_abs.as_path())
+                .join("nincfg.bin");
+            if nincfg_path.exists() {
+                log::warn!(
+                    "overwriting existing {} (each build's nincfg.bin is game-specific)",
+                    nincfg_path.display()
+                );
+            }
+            std::fs::write(&nincfg_path, nincfg).map_err(|e| Error::io(&nincfg_path, e))?;
+            log::info!(
+                "wrote {} — copy it to your SD card root for Nintendont",
+                nincfg_path.display()
+            );
+            Ok(())
+        },
+    )
+}
 
-    let title = resolve_title(&config, &game_id);
-    let meta_path = staged.meta_dir.join("meta.xml");
+/// Shared tail of both injection paths: regenerate `app.xml`/`meta.xml`, resolve the boot
+/// textures, package the WUP, and build the `Summary`. `textures_key` selects the boot-art
+/// repository convention (`"wii"` vs `"gcn"`, see [`resolve_textures`]); `after_package` runs
+/// after `build_package` but before the `Summary` is built (the GameCube path uses it to emit
+/// `nincfg.bin`; the Wii path passes a no-op).
+#[allow(clippy::too_many_arguments)]
+fn finish_package(
+    config: &Config,
+    work_dir: &Path,
+    code_dir: &Path,
+    meta_dir: &Path,
+    ids: &titleid::TitleIds,
+    game_id: String,
+    textures_key: &str,
+    after_package: impl FnOnce(&PackageStats) -> Result<()>,
+) -> Result<Summary> {
+    // 6. Metadata: app.xml + meta.xml.
+    std::fs::write(code_dir.join("app.xml"), appxml::generate(ids))
+        .map_err(|e| Error::io(code_dir.join("app.xml"), e))?;
+
+    let title = resolve_title(config, &game_id);
+    let meta_path = meta_dir.join("meta.xml");
     let base_meta = std::fs::read_to_string(&meta_path).map_err(|e| Error::io(&meta_path, e))?;
     let patched = patch_meta(
         &base_meta,
         &MetaOptions {
-            ids: &ids,
+            ids,
             long_name: &title,
             short_name: &title,
             publisher: "",
@@ -325,8 +359,8 @@ fn run_gamecube(mut config: Config, work_dir: &Path) -> Result<Summary> {
     )?;
     std::fs::write(&meta_path, patched).map_err(|e| Error::io(&meta_path, e))?;
 
-    // 7. Boot textures (GameCube art repository; UWUVCI-IMAGES keys GameCube under "gcn").
-    resolve_textures(&config, "gcn", &game_id, &staged.meta_dir)?;
+    // 7. Boot textures (icon / TV / DRC; UWUVCI-IMAGES keys GameCube art under "gcn").
+    resolve_textures(config, textures_key, &game_id, meta_dir)?;
 
     // 8. Package.
     log::info!("packaging WUP into {}", config.out.display());
@@ -339,35 +373,7 @@ fn run_gamecube(mut config: Config, work_dir: &Path) -> Result<Summary> {
     };
     let package = build_package(work_dir, &config.out, &params)?;
 
-    // 9. Emit nincfg.bin next to the output package (it belongs at the SD-card root, not in the WUP).
-    let nincfg = nincfg::generate(&NincfgOptions {
-        game_id: game_id4,
-        widescreen: gc_opts.widescreen,
-        language: gc_opts.language,
-        video_mode: gc_opts.video_mode,
-        memcard_emu: gc_opts.memcard_emu,
-        cheat_path: gc_opts.cheat_path.clone(),
-        ..Default::default()
-    });
-    // Resolve --out to an absolute path first: a bare relative `--out` (e.g. `MyGame`, with no
-    // parent component) would otherwise leave `parent()` ambiguous, landing nincfg.bin wherever
-    // the process happens to be running from rather than reliably next to the output.
-    let out_abs = std::path::absolute(&config.out).map_err(|e| Error::io(&config.out, e))?;
-    let nincfg_path = out_abs
-        .parent()
-        .unwrap_or(out_abs.as_path())
-        .join("nincfg.bin");
-    if nincfg_path.exists() {
-        log::warn!(
-            "overwriting existing {} (each build's nincfg.bin is game-specific)",
-            nincfg_path.display()
-        );
-    }
-    std::fs::write(&nincfg_path, nincfg).map_err(|e| Error::io(&nincfg_path, e))?;
-    log::info!(
-        "wrote {} — copy it to your SD card root for Nintendont",
-        nincfg_path.display()
-    );
+    after_package(&package)?;
 
     Ok(Summary {
         title_id: ids.title_id,
