@@ -198,7 +198,7 @@ fn write_partition<R: Read + Seek + ?Sized>(
                 }
             }
             apply_edits_to_group(&mut clusters, g, &pp.edits);
-            recompute_group(&mut clusters);
+            recompute_group(&mut clusters)?;
             for (k, cluster) in clusters.iter_mut().enumerate() {
                 let ps = g as u64 * SECTORS_PER_GROUP as u64 + k as u64;
                 if ps < total {
