@@ -41,7 +41,7 @@ fn main() {
     println!(".h3 file size = {}", h3_file.len());
 
     // Decode then re-encode to obtain the canonical tree + h3 for the same plaintext.
-    let plain = decode_hashed(&TITLE_KEY, rec.index, &app);
+    let plain = decode_hashed(&TITLE_KEY, rec.index, &app).expect("decode hashed content");
     println!("decoded plaintext len = {}", plain.len());
     let re = encode_hashed(&TITLE_KEY, rec.index, &plain);
 

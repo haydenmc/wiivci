@@ -136,6 +136,10 @@ impl Fst {
 
     /// Parse an FST from bytes (inverse of [`serialize`](Self::serialize)); trailing content
     /// padding after the name table is ignored.
+    ///
+    /// `data` may be untrusted (a downloaded/user-supplied title's content 0): every offset and
+    /// count read from it is checked against `data`'s actual length before being used to index,
+    /// so hostile values return `None` instead of panicking.
     pub fn parse(data: &[u8]) -> Option<Fst> {
         use byteorder::ByteOrder;
         if data.len() < 0x20 || &data[0..4] != b"FST\0" {
@@ -143,6 +147,14 @@ impl Fst {
         }
         let offset_factor = BigEndian::read_u32(&data[4..8]);
         let content_count = BigEndian::read_u32(&data[8..12]) as usize;
+
+        // Bound the content table against `data`'s real length before trusting `content_count`
+        // enough to index with it or size a `Vec::with_capacity`.
+        let contents_bytes = content_count.checked_mul(0x20)?;
+        let entries_start = 0x20usize.checked_add(contents_bytes)?;
+        if data.len() < entries_start {
+            return None;
+        }
 
         let mut contents = Vec::with_capacity(content_count);
         for i in 0..content_count {
@@ -156,22 +168,36 @@ impl Fst {
             });
         }
 
-        let entries_start = 0x20 + content_count * 0x20;
-        // The root entry's size field is the total number of entries.
+        // The root entry's size field (at entries_start + 8..12) is the total number of entries;
+        // make sure the root entry itself (0x10 bytes) is actually present before reading it.
+        if data.len() < entries_start.checked_add(0x10)? {
+            return None;
+        }
         let root_size = BigEndian::read_u32(&data[entries_start + 8..entries_start + 12]) as usize;
-        let name_table = entries_start + root_size * 0x10;
 
-        let read_name = |name_off: u32| -> String {
-            let start = name_table + name_off as usize;
+        // Bound the entry table (and therefore the name table start) the same way.
+        let entries_bytes = root_size.checked_mul(0x10)?;
+        let name_table = entries_start.checked_add(entries_bytes)?;
+        if data.len() < name_table {
+            return None;
+        }
+
+        let read_name = |name_off: u32| -> Option<String> {
+            let start = name_table.checked_add(name_off as usize)?;
+            if start > data.len() {
+                return None;
+            }
             let end = data[start..]
                 .iter()
                 .position(|&b| b == 0)
                 .map_or(data.len(), |p| start + p);
-            String::from_utf8_lossy(&data[start..end]).into_owned()
+            Some(String::from_utf8_lossy(&data[start..end]).into_owned())
         };
 
         let mut nodes = Vec::with_capacity(root_size);
         for i in 0..root_size {
+            // Safe: o + 0x10 <= entries_start + entries_bytes == name_table <= data.len(),
+            // established above.
             let o = entries_start + i * 0x10;
             let type_byte = data[o];
             let name_off =
@@ -193,7 +219,7 @@ impl Fst {
             };
             let type_flags = type_byte & !0x01;
             nodes.push(FstNode {
-                name: read_name(name_off),
+                name: read_name(name_off)?,
                 kind,
                 type_flags,
                 flags,
@@ -311,5 +337,60 @@ mod tests {
             data[ours.len()..].iter().all(|&b| b == 0),
             "trailing bytes should be padding"
         );
+    }
+
+    // --- Hostile-input bounds checks ---------------------------------------------------
+    // `Fst::parse` reads content_count / root_size / name offsets from untrusted bytes (a
+    // downloaded or user-supplied title's content 0) and must return `None`, never panic, when
+    // those values don't fit the actual buffer.
+
+    /// A bare 0x20-byte FST header claiming `content_count` content descriptors.
+    fn fst_header(content_count: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FST\0");
+        out.extend_from_slice(&OFFSET_FACTOR.to_be_bytes());
+        out.extend_from_slice(&content_count.to_be_bytes());
+        out.extend_from_slice(&[0u8; 20]);
+        out
+    }
+
+    #[test]
+    fn parse_rejects_oversized_content_count() {
+        // content_count claims far more content descriptors than the buffer could ever hold.
+        let data = fst_header(u32::MAX);
+        assert!(Fst::parse(&data).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_truncated_content_table() {
+        // content_count = 1, but the buffer ends right after the header (no content bytes).
+        let data = fst_header(1);
+        assert!(Fst::parse(&data).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_root_size_past_buffer() {
+        // content_count = 0, so entries start right after the 0x20-byte header. The root entry's
+        // size field (the total entry count) claims far more entries than the buffer holds.
+        let mut data = fst_header(0);
+        data.extend_from_slice(&[0u8; 8]); // type byte + name_off + offset/parent_index
+        data.extend_from_slice(&0x7FFF_FFFFu32.to_be_bytes()); // size = huge entry count
+        data.extend_from_slice(&[0u8; 4]); // flags + cluster
+        assert_eq!(data.len(), 0x30);
+        assert!(Fst::parse(&data).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_name_offset_past_buffer() {
+        // content_count = 0, root_size = 1 (just the root entry), but its name offset points
+        // far past the end of the (short) name table.
+        let mut data = fst_header(0);
+        data.push(0x01); // dir bit
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // name_off = 0x00FFFFFF
+        data.extend_from_slice(&0u32.to_be_bytes()); // parent_index
+        data.extend_from_slice(&1u32.to_be_bytes()); // end_index / root entry count = 1
+        data.extend_from_slice(&[0u8; 4]); // flags + cluster
+        assert_eq!(data.len(), 0x30);
+        assert!(Fst::parse(&data).is_none());
     }
 }
