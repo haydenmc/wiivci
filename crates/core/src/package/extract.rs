@@ -272,13 +272,23 @@ mod tests {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev/base");
         let tmd = match std::fs::read(dir.join("title.tmd")) {
             Ok(t) => t,
-            Err(_) => return,
+            Err(_) => {
+                eprintln!(
+                    "skipping extracts_retail_matching_wua: {} not present",
+                    dir.join("title.tmd").display()
+                );
+                return;
+            }
         };
         if !base.join("code/app.xml").exists() {
-            eprintln!("skipping: run the stage_base example to populate .dev/base");
+            eprintln!(
+                "skipping extracts_retail_matching_wua: {} not present (run the stage_base example to populate .dev/base)",
+                base.join("code/app.xml").display()
+            );
             return;
         }
         let Ok(hex) = std::env::var("WIIU_COMMON_KEY") else {
+            eprintln!("skipping extracts_retail_matching_wua: WIIU_COMMON_KEY not present");
             return;
         };
         let mut common = [0u8; 16];

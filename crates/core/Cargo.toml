@@ -3,6 +3,7 @@ name = "wiivci-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Library for injecting Wii games into Wii U Virtual Console (WUP) packages"
 
 [dependencies]
@@ -22,4 +23,4 @@ zarust = "0.2.1"
 sha2 = "0.10"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true

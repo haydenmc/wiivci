@@ -309,7 +309,10 @@ mod tests {
     fn reproduces_reference_fst_byte_for_byte() {
         let path = reference_fst_path();
         if !path.exists() {
-            eprintln!("skipping: {} not present", path.display());
+            eprintln!(
+                "skipping reproduces_reference_fst_byte_for_byte: {} not present",
+                path.display()
+            );
             return;
         }
         let data = std::fs::read(&path).unwrap();

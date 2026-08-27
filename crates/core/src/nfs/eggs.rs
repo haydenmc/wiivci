@@ -72,11 +72,6 @@ impl EggsHeader {
         &self.ranges
     }
 
-    /// Total number of sectors covered by all ranges.
-    pub fn total_sectors(&self) -> u64 {
-        self.ranges.iter().map(|r| r.num_sectors as u64).sum()
-    }
-
     /// Serialize to the fixed 0x200-byte header.
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
@@ -164,7 +159,6 @@ mod tests {
         ];
         let header = EggsHeader::new(ranges.clone()).unwrap();
         assert_eq!(header.ranges(), ranges.as_slice());
-        assert_eq!(header.total_sectors(), 2 * MAX_RANGES as u64);
 
         let bytes = header.to_bytes();
         assert_eq!(&bytes[16..20], &[0, 0, 0, MAX_RANGES as u8]);

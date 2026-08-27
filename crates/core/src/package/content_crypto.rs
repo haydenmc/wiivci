@@ -19,11 +19,11 @@
 use std::io::{self, Cursor, Read, Write};
 
 use aes::cipher::block_padding::UnpadError;
-use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use aes::Aes128;
 use sha1::{Digest, Sha1};
 
+use crate::aes_cbc;
 use crate::error::{Error, Result};
+use crate::util::align_up;
 
 /// Plaintext bytes per hashed block.
 pub const HASH_BLOCK_DATA: usize = 0xFC00;
@@ -53,30 +53,20 @@ fn sha1(data: &[u8]) -> Hash {
 }
 
 fn cbc_encrypt(key: &Key, iv: [u8; 16], buf: &mut [u8]) {
-    let len = buf.len();
-    <cbc::Encryptor<Aes128>>::new(key.into(), &iv.into())
-        .encrypt_padded_mut::<NoPadding>(buf, len)
-        .expect("block-aligned buffer");
+    aes_cbc::encrypt(key, iv, buf).expect("block-aligned buffer");
 }
 
 /// Decrypt `buf` in place with AES-128-CBC (no padding). Errors (rather than panics) if
 /// `buf.len()` is not a multiple of the AES block size (16) — reachable with a truncated or
 /// otherwise corrupted ciphertext from an HTTP download or user-supplied file.
 fn cbc_decrypt(key: &Key, iv: [u8; 16], buf: &mut [u8]) -> std::result::Result<(), UnpadError> {
-    <cbc::Decryptor<Aes128>>::new(key.into(), &iv.into())
-        .decrypt_padded_mut::<NoPadding>(buf)
-        .map(|_| ())
+    aes_cbc::decrypt(key, iv, buf)
 }
 
 fn content_iv(index: u16) -> [u8; 16] {
     let mut iv = [0u8; 16];
     iv[0..2].copy_from_slice(&index.to_be_bytes());
     iv
-}
-
-/// Round `n` up to the next multiple of `to`.
-fn round_up(n: usize, to: usize) -> usize {
-    n.div_ceil(to) * to
 }
 
 /// The result of encoding one content.
@@ -95,7 +85,7 @@ pub struct EncodedContent {
 /// Encrypt a non-hashed content (`0x2001`).
 pub fn encode_nonhashed(key: &Key, index: u16, plaintext: &[u8]) -> EncodedContent {
     let mut buf = plaintext.to_vec();
-    buf.resize(round_up(buf.len().max(1), CONTENT_PADDING), 0);
+    buf.resize(align_up(buf.len().max(1), CONTENT_PADDING), 0);
     let tmd_hash = sha1(&buf);
     cbc_encrypt(key, content_iv(index), &mut buf);
     let size = buf.len() as u64;
@@ -271,7 +261,7 @@ pub fn decode_nonhashed(key: &Key, index: u16, cipher: &[u8]) -> Result<Vec<u8>>
 /// `cipher`'s length is not an exact multiple of [`HASH_BLOCK_TOTAL`] (0x10000) — reachable from
 /// a truncated/corrupted HTTP download or user-supplied file.
 pub fn decode_hashed(key: &Key, index: u16, cipher: &[u8]) -> Result<Vec<u8>> {
-    if !cipher.len().is_multiple_of(HASH_BLOCK_TOTAL) {
+    if cipher.len() % HASH_BLOCK_TOTAL != 0 {
         return Err(Error::UnsupportedDisc(format!(
             "hashed content ciphertext length {} is not a multiple of the hashed block size (0x{HASH_BLOCK_TOTAL:x})",
             cipher.len()
@@ -568,9 +558,20 @@ mod tests {
         let dir = ref_dir();
         let fst = match std::fs::read(dir.join("fst_decrypted.bin")) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => {
+                eprintln!(
+                    "skipping retail_nonhashed_content0_matches: {} not present",
+                    dir.join("fst_decrypted.bin").display()
+                );
+                return;
+            }
         };
-        let Some(tk) = retail_title_key() else { return };
+        let Some(tk) = retail_title_key() else {
+            eprintln!(
+                "skipping retail_nonhashed_content0_matches: .dev/wup_ref/title.tik or WIIU_COMMON_KEY not present"
+            );
+            return;
+        };
         let reference = std::fs::read(dir.join("00000000.app")).unwrap();
         let out = encode_nonhashed(&tk, 0, &fst);
         assert_eq!(out.data, reference, "content0 ciphertext mismatch");
@@ -583,9 +584,20 @@ mod tests {
         let dir = ref_dir();
         let enc = match std::fs::read(dir.join("00000003.app")) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => {
+                eprintln!(
+                    "skipping retail_hashed_content3_matches: {} not present",
+                    dir.join("00000003.app").display()
+                );
+                return;
+            }
         };
-        let Some(tk) = retail_title_key() else { return };
+        let Some(tk) = retail_title_key() else {
+            eprintln!(
+                "skipping retail_hashed_content3_matches: .dev/wup_ref/title.tik or WIIU_COMMON_KEY not present"
+            );
+            return;
+        };
         let h3_ref = std::fs::read(dir.join("00000003.h3")).unwrap();
 
         // Decrypt the retail hashed content back to plaintext, then re-encode: an exact

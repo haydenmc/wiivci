@@ -74,6 +74,10 @@ mod tests {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev/wup_ref/title.cert");
         if !path.exists() {
+            eprintln!(
+                "skipping accepts_reference_cert: {} not present",
+                path.display()
+            );
             return;
         }
         let chain = CertChain::load(&path).expect("load reference cert");

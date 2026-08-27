@@ -15,19 +15,17 @@ pub mod split;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::consts::SECTORS_PER_GROUP;
 use crate::disc_patch::{apply_edits_to_group, recompute_group, DiscPlan, PartitionPlan};
 use crate::error::{Error, Result};
 use crate::input::{DecryptedDisc, DISC_SECTOR_SIZE};
 use eggs::{EggsHeader, LbaRange};
 use split::SplitWriter;
 
-/// Clusters per Wii hash group (must match [`crate::disc_patch`]).
-const SECTORS_PER_GROUP: usize = 64;
-
 /// Bytes of file data per cluster: the 0x8000 cluster minus its 0x400 hash block (must match
-/// `crate::disc_patch`'s `DATA`). [`PartitionPlan::edits`] are keyed by this logical data offset,
-/// unlike `disc_patches`/`header_patches`, which use absolute disc byte offsets.
-const DATA_PER_SECTOR: u64 = DISC_SECTOR_SIZE as u64 - 0x400;
+/// [`crate::consts::CLUSTER_DATA`]). [`PartitionPlan::edits`] are keyed by this logical data
+/// offset, unlike `disc_patches`/`header_patches`, which use absolute disc byte offsets.
+const DATA_PER_SECTOR: u64 = crate::consts::CLUSTER_DATA as u64;
 
 /// Outcome of an NFS build.
 #[derive(Debug, Clone)]
@@ -563,7 +561,10 @@ mod tests {
         let title = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_titles/Wii Sports (USA).rvz");
         if !title.exists() {
-            eprintln!("skipping: {} not present", title.display());
+            eprintln!(
+                "skipping nfs_rebuilds_valid_wii_hashes: {} not present",
+                title.display()
+            );
             return;
         }
 
@@ -652,7 +653,10 @@ mod tests {
         let title = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_titles/Super Smash Bros. Brawl (USA) (Rev 2).rvz");
         if !title.exists() {
-            eprintln!("skipping: {} not present", title.display());
+            eprintln!(
+                "skipping zero_trim_shrinks_nfs: {} not present",
+                title.display()
+            );
             return;
         }
         let htk = [0x5Au8; 16];

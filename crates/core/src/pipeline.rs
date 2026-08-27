@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::assets::images::{png_to_tga, BootTexture};
 use crate::assets::{artrepo, gametdb};
 use crate::base::BaseSource;
+use crate::consts::{TMD_CONTENT0_HASH, WII_SIG};
 use crate::disc_patch;
 use crate::error::{Error, Result};
 use crate::fwimg;
@@ -439,9 +440,6 @@ fn resolve_textures(config: &Config, platform: &str, game_id: &str, meta_dir: &P
     Ok(())
 }
 
-/// The RSA-2048 signature region of a Wii ticket/TMD (`0x004..0x104`).
-const WII_SIG: std::ops::Range<usize> = 0x004..0x104;
-
 /// Fakesign a Wii ticket or TMD by zeroing its RSA signature. `fw.img`'s signature check is patched
 /// to accept a zeroed signature, so `rvlt.tik`/`rvlt.tmd` must be fakesigned this way (their
 /// original Nintendo signatures are rejected by the patched check and hang the emulator at boot).
@@ -455,10 +453,9 @@ fn fakesign(data: &mut [u8]) {
 /// rebuilt H3 table and fakesign it. The Wii TMD stores the content hash at `0x1F4` and its
 /// RSA-2048 signature at `0x004..0x104`.
 fn update_rvlt_tmd(tmd: &mut [u8], content_hash: &[u8; 20]) {
-    const CONTENT0_HASH: usize = 0x1F4;
-    if tmd.len() >= CONTENT0_HASH + 20 {
+    if tmd.len() >= TMD_CONTENT0_HASH + 20 {
         tmd[WII_SIG].fill(0);
-        tmd[CONTENT0_HASH..CONTENT0_HASH + 20].copy_from_slice(content_hash);
+        tmd[TMD_CONTENT0_HASH..TMD_CONTENT0_HASH + 20].copy_from_slice(content_hash);
     }
 }
 

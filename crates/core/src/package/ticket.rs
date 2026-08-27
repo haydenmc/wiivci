@@ -129,6 +129,10 @@ mod tests {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev/wup_ref/title.tik");
         if !path.exists() {
+            eprintln!(
+                "skipping reproduces_reference_ticket_body: {} not present",
+                path.display()
+            );
             return;
         }
         let reference = std::fs::read(&path).unwrap();

@@ -223,7 +223,10 @@ mod tests {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev/base/code/fw.img");
         if !path.exists() {
-            eprintln!("skipping: {} not present", path.display());
+            eprintln!(
+                "skipping patches_real_base_fwimg: {} not present",
+                path.display()
+            );
             return;
         }
         let mut data = std::fs::read(&path).unwrap();
